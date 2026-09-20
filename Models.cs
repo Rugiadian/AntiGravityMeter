@@ -10,6 +10,15 @@ namespace AntiGravityMeter
         Busy
     }
 
+    public class ModelQuotaItem
+    {
+        public string Title { get; set; } = "";
+        public string Description { get; set; } = "";
+        public int RemainingPercent { get; set; } = 100;
+        public string RefreshTimeText { get; set; } = "";
+        public DateTime ResetTime { get; set; } = DateTime.MinValue;
+    }
+
     public class ConvSummaryItem
     {
         public string Id { get; set; } = "";
@@ -33,6 +42,24 @@ namespace AntiGravityMeter
         public double MemoryMb { get; set; }
         public double CpuPercent { get; set; }
 
+        public string UserPlan { get; set; } = "Google AI Pro";
+
+        // Main Quotas (Gemini)
+        public ModelQuotaItem FiveHourLimit { get; set; } = new()
+        {
+            Title = "Five Hour Limit Remaining",
+            RemainingPercent = 92,
+            RefreshTimeText = "it will fully refresh in 4 hours, 40 minutes."
+        };
+
+        public ModelQuotaItem WeeklyLimit { get; set; } = new()
+        {
+            Title = "Weekly Limit Remaining",
+            RemainingPercent = 85,
+            RefreshTimeText = "it will fully refresh in 2 days, 12 hours."
+        };
+
+        // Advanced metrics
         public int TotalConversations { get; set; }
         public int TotalSteps { get; set; }
 

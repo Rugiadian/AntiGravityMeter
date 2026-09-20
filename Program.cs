@@ -21,6 +21,8 @@ namespace AntiGravityMeter
                 Console.WriteLine($"Today API Calls: {m.TodayApiCalls} / Total: {m.TotalApiCalls}");
                 Console.WriteLine($"Active Conv: {m.ActiveConvTitle} ({m.ActiveConvSteps} steps)");
                 Console.WriteLine($"Active Model: {m.ActiveModel}");
+                Console.WriteLine($"5-Hour Limit: {m.FiveHourLimit.RemainingPercent}% ({m.FiveHourLimit.RefreshTimeText})");
+                Console.WriteLine($"Weekly Limit: {m.WeeklyLimit.RemainingPercent}% ({m.WeeklyLimit.RefreshTimeText})");
                 Console.WriteLine($"Last Activity: {m.LastActivityTime:yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine("\nRecent Conversations:");
                 foreach (var c in m.RecentConversations)

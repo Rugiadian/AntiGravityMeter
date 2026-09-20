@@ -1,7 +1,5 @@
 using System;
 using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -20,7 +18,6 @@ namespace AntiGravityMeter
 
         private readonly AgyCollector _collector;
         private readonly System.Windows.Forms.Timer _pollTimer;
-        private readonly System.Windows.Forms.Timer _animTimer;
         private AgyMetrics _metrics = new();
 
         // UI States
@@ -28,46 +25,44 @@ namespace AntiGravityMeter
         private bool _isAlwaysOnTop = true;
         private double[] _opacities = new double[] { 0.95, 0.80, 0.60 };
         private int _opacityIdx = 0;
-        private float _pulsePhase = 0f;
 
         // Visual Constants
-        private const int COMPACT_HEIGHT = 158;
-        private const int EXPANDED_HEIGHT = 410;
-        private const int WIDGET_WIDTH = 340;
+        private const int COMPACT_HEIGHT = 208;
+        private const int EXPANDED_HEIGHT = 445;
+        private const int WIDGET_WIDTH = 360;
 
         // Custom Colors
         private readonly Color ColorBgDark = Color.FromArgb(20, 24, 33);
-        private readonly Color ColorBgCard = Color.FromArgb(28, 34, 46);
         private readonly Color ColorHeader = Color.FromArgb(25, 30, 42);
         private readonly Color ColorBorder = Color.FromArgb(48, 58, 78);
         private readonly Color ColorAccentGold = Color.FromArgb(235, 168, 48);
-        private readonly Color ColorGreenLive = Color.FromArgb(46, 204, 113);
-        private readonly Color ColorAmberIdle = Color.FromArgb(243, 156, 18);
+        private readonly Color ColorPlanBadge = Color.FromArgb(142, 68, 173);
         private readonly Color ColorMutedGray = Color.FromArgb(145, 158, 178);
         private readonly Color ColorTextWhite = Color.FromArgb(240, 243, 248);
 
         // Header controls
         private Label lblTitle = null!;
-        private Label lblStatusBadge = null!;
+        private Label lblPlanBadge = null!;
         private Button btnPin = null!;
         private Button btnOpacity = null!;
-        private Button btnToggleExpand = null!;
+        private Button btnRefresh = null!;
         private Button btnClose = null!;
         private Panel pnlHeader = null!;
 
-        // Compact stats
+        // Quota Cards (The Core Circular Donut Infographics from Screenshot)
+        private CircularQuotaCard cardWeekly = null!;
+        private CircularQuotaCard cardFiveHour = null!;
+
+        // Advanced Mode Toggle Button
+        private Button btnToggleAdvanced = null!;
+
+        // Advanced Panel (Hidden in Default Mode)
+        private Panel pnlAdvanced = null!;
         private Label lblValTodayCalls = null!;
         private Label lblValTodayPrompts = null!;
         private Label lblValActiveSteps = null!;
         private Label lblValRam = null!;
-        private Label lblModelBadge = null!;
-        private Label lblLastActive = null!;
-
-        // Expanded Panel
-        private Panel pnlExpanded = null!;
         private ListView lvRecentConvs = null!;
-        private Label lblRecentPromptTitle = null!;
-        private Label lblRecentPromptText = null!;
 
         private NotifyIcon? _trayIcon;
 
@@ -79,24 +74,15 @@ namespace AntiGravityMeter
             InitializeComponent();
             SetupTrayIcon();
 
-            // Background Polling Timer (every 1.5 seconds)
-            _pollTimer = new System.Windows.Forms.Timer { Interval = 1500 };
-            _pollTimer.Tick += async (s, e) => await RefreshDataAsync();
-
-            // Pulse Animation Timer (every 60ms)
-            _animTimer = new System.Windows.Forms.Timer { Interval = 60 };
-            _animTimer.Tick += (s, e) =>
-            {
-                _pulsePhase = (_pulsePhase + 0.12f) % (float)(Math.PI * 2);
-                lblStatusBadge.Invalidate();
-            };
+            // Background Polling Timer (every 2.0 seconds)
+            _pollTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+            _pollTimer.Tick += async (s, e) => await RefreshDataAsync(false);
 
             Load += async (s, e) =>
             {
                 PositionAtBottomRight();
                 _pollTimer.Start();
-                _animTimer.Start();
-                await RefreshDataAsync();
+                await RefreshDataAsync(true);
             };
         }
 
@@ -137,7 +123,7 @@ namespace AntiGravityMeter
 
             lblTitle = new Label
             {
-                Text = "⚡ AGY Meter",
+                Text = "⚡ Gemini Models",
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
                 ForeColor = ColorTextWhite,
                 AutoSize = true,
@@ -146,22 +132,20 @@ namespace AntiGravityMeter
             };
             lblTitle.MouseDown += Window_MouseDown;
 
-            lblStatusBadge = new Label
+            lblPlanBadge = new Label
             {
-                Text = " ● OFF ",
-                Font = new Font("Segoe UI", 8.2f, FontStyle.Bold),
+                Text = "Google AI Pro",
+                Font = new Font("Segoe UI", 7.8f, FontStyle.Bold),
                 ForeColor = Color.White,
-                BackColor = Color.FromArgb(60, 70, 85),
+                BackColor = ColorPlanBadge,
                 AutoSize = true,
-                Location = new Point(108, 8),
-                Padding = new Padding(3, 1, 3, 1),
+                Location = new Point(132, 8),
+                Padding = new Padding(4, 2, 4, 2),
                 Cursor = Cursors.SizeAll
             };
-            lblStatusBadge.MouseDown += Window_MouseDown;
-            lblStatusBadge.Paint += LblStatusBadge_Paint;
+            lblPlanBadge.MouseDown += Window_MouseDown;
 
-            // Buttons
-            btnPin = CreateHeaderButton("📌", "항상 위에 고정 토글", 168);
+            btnPin = CreateHeaderButton("📌", "항상 위에 고정 토글", 232);
             btnPin.Click += (s, e) =>
             {
                 _isAlwaysOnTop = !_isAlwaysOnTop;
@@ -170,20 +154,17 @@ namespace AntiGravityMeter
             };
             btnPin.ForeColor = _isAlwaysOnTop ? ColorAccentGold : ColorMutedGray;
 
-            btnOpacity = CreateHeaderButton("◐", "투명도 조절", 204);
+            btnOpacity = CreateHeaderButton("◐", "투명도 조절", 262);
             btnOpacity.Click += (s, e) =>
             {
                 _opacityIdx = (_opacityIdx + 1) % _opacities.Length;
                 Opacity = _opacities[_opacityIdx];
             };
 
-            btnToggleExpand = CreateHeaderButton("▾", "상세 통계 펼치기/접기", 240);
-            btnToggleExpand.Click += (s, e) => ToggleExpandMode();
+            btnRefresh = CreateHeaderButton("🔄", "실시간 쿼터 새로고침", 292);
+            btnRefresh.Click += async (s, e) => await RefreshDataAsync(true);
 
-            Button btnRefresh = CreateHeaderButton("🔄", "지금 새로고침", 276);
-            btnRefresh.Click += async (s, e) => await RefreshDataAsync();
-
-            btnClose = CreateHeaderButton("✕", "트레이로 최소화", 308);
+            btnClose = CreateHeaderButton("✕", "트레이로 최소화", 324);
             btnClose.Click += (s, e) =>
             {
                 Hide();
@@ -194,35 +175,72 @@ namespace AntiGravityMeter
             };
 
             pnlHeader.Controls.Add(lblTitle);
-            pnlHeader.Controls.Add(lblStatusBadge);
+            pnlHeader.Controls.Add(lblPlanBadge);
             pnlHeader.Controls.Add(btnPin);
             pnlHeader.Controls.Add(btnOpacity);
-            pnlHeader.Controls.Add(btnToggleExpand);
             pnlHeader.Controls.Add(btnRefresh);
             pnlHeader.Controls.Add(btnClose);
 
-            // 2. Main Stat Cards Container
-            var pnlMainCards = new Panel
+            // 2. Circular Quota Cards (From User Screenshot)
+            cardWeekly = new CircularQuotaCard
             {
                 Location = new Point(8, 42),
-                Size = new Size(324, 82),
-                BackColor = Color.Transparent
+                Size = new Size(344, 58),
+                Title = "Weekly Limit Remaining",
+                Subtitle = "it will fully refresh in 2 days, 12 hours.",
+                Percent = 85
             };
-            pnlMainCards.MouseDown += Window_MouseDown;
+            cardWeekly.MouseDown += Window_MouseDown;
 
-            int cardW = 76;
-            int cardH = 78;
+            cardFiveHour = new CircularQuotaCard
+            {
+                Location = new Point(8, 104),
+                Size = new Size(344, 58),
+                Title = "Five Hour Limit Remaining",
+                Subtitle = "it will fully refresh in 4 hours, 40 minutes.",
+                Percent = 92
+            };
+            cardFiveHour.MouseDown += Window_MouseDown;
+
+            // 3. Advanced Mode Toggle Button (Compact footer)
+            btnToggleAdvanced = new Button
+            {
+                Text = "▾ 고급 통계 보기 (호출/RAM/대화)",
+                Location = new Point(8, 168),
+                Size = new Size(344, 28),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(28, 34, 46),
+                ForeColor = ColorMutedGray,
+                Font = new Font("Segoe UI", 8.2f),
+                Cursor = Cursors.Hand
+            };
+            btnToggleAdvanced.FlatAppearance.BorderSize = 0;
+            btnToggleAdvanced.FlatAppearance.MouseOverBackColor = Color.FromArgb(38, 46, 62);
+            btnToggleAdvanced.Click += (s, e) => ToggleAdvancedMode();
+
+            // 4. Advanced Panel (Hidden by default)
+            pnlAdvanced = new Panel
+            {
+                Location = new Point(8, 202),
+                Size = new Size(344, 235),
+                BackColor = Color.Transparent,
+                Visible = false
+            };
+
+            // Mini Stat Grid
+            int cardW = 81;
+            int cardH = 68;
             int spacing = 6;
 
             var cardCalls = CreateStatCard("오늘 호출", "🔥", out lblValTodayCalls, "0회", ColorAccentGold);
             cardCalls.Location = new Point(0, 0);
             cardCalls.Size = new Size(cardW, cardH);
 
-            var cardPrompts = CreateStatCard("오늘 프롬프트", "💬", out lblValTodayPrompts, "0회", Color.FromArgb(120, 200, 255));
+            var cardPrompts = CreateStatCard("프롬프트", "💬", out lblValTodayPrompts, "0회", Color.FromArgb(120, 200, 255));
             cardPrompts.Location = new Point(cardW + spacing, 0);
             cardPrompts.Size = new Size(cardW, cardH);
 
-            var cardSteps = CreateStatCard("세션 스텝", "🎯", out lblValActiveSteps, "0 st", ColorGreenLive);
+            var cardSteps = CreateStatCard("세션 스텝", "🎯", out lblValActiveSteps, "0 st", Color.FromArgb(46, 204, 113));
             cardSteps.Location = new Point((cardW + spacing) * 2, 0);
             cardSteps.Size = new Size(cardW, cardH);
 
@@ -230,111 +248,45 @@ namespace AntiGravityMeter
             cardRam.Location = new Point((cardW + spacing) * 3, 0);
             cardRam.Size = new Size(cardW, cardH);
 
-            pnlMainCards.Controls.Add(cardCalls);
-            pnlMainCards.Controls.Add(cardPrompts);
-            pnlMainCards.Controls.Add(cardSteps);
-            pnlMainCards.Controls.Add(cardRam);
+            pnlAdvanced.Controls.Add(cardCalls);
+            pnlAdvanced.Controls.Add(cardPrompts);
+            pnlAdvanced.Controls.Add(cardSteps);
+            pnlAdvanced.Controls.Add(cardRam);
 
-            // 3. Compact Footer Bar (Model & Activity)
-            var pnlFooter = new Panel
-            {
-                Location = new Point(8, 128),
-                Size = new Size(324, 24),
-                BackColor = Color.Transparent
-            };
-            pnlFooter.MouseDown += Window_MouseDown;
-
-            lblModelBadge = new Label
-            {
-                Text = "🤖 gemini-3.8-flash",
-                Font = new Font("Segoe UI", 8.0f, FontStyle.Regular),
-                ForeColor = Color.FromArgb(175, 185, 205),
-                AutoSize = true,
-                Location = new Point(2, 4),
-                Cursor = Cursors.SizeAll
-            };
-            lblModelBadge.MouseDown += Window_MouseDown;
-
-            lblLastActive = new Label
-            {
-                Text = "🕒 갱신 중...",
-                Font = new Font("Segoe UI", 8.0f, FontStyle.Regular),
-                ForeColor = ColorMutedGray,
-                AutoSize = false,
-                Size = new Size(160, 20),
-                TextAlign = ContentAlignment.MiddleRight,
-                Location = new Point(162, 2),
-                Cursor = Cursors.SizeAll
-            };
-            lblLastActive.MouseDown += Window_MouseDown;
-
-            pnlFooter.Controls.Add(lblModelBadge);
-            pnlFooter.Controls.Add(lblLastActive);
-
-            // 4. Expanded Panel
-            pnlExpanded = new Panel
-            {
-                Location = new Point(8, 156),
-                Size = new Size(324, 246),
-                BackColor = Color.Transparent,
-                Visible = false
-            };
-
+            // Recent Conversations List
             var lblRecentConvTitle = new Label
             {
-                Text = "📋 최근 대화 세션 목록",
+                Text = "📋 최근 대화 세션",
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorTextWhite,
-                Location = new Point(2, 2),
+                Location = new Point(0, 74),
                 AutoSize = true
             };
 
             lvRecentConvs = new ListView
             {
-                Location = new Point(2, 24),
-                Size = new Size(320, 125),
+                Location = new Point(0, 96),
+                Size = new Size(344, 134),
                 View = View.Details,
                 FullRowSelect = true,
-                BackColor = ColorBgCard,
+                BackColor = Color.FromArgb(28, 34, 46),
                 ForeColor = ColorTextWhite,
                 BorderStyle = BorderStyle.None,
                 HeaderStyle = ColumnHeaderStyle.Nonclickable,
                 Font = new Font("Segoe UI", 8.2f)
             };
-            lvRecentConvs.Columns.Add("대화 세션 제목", 170);
+            lvRecentConvs.Columns.Add("세션 제목", 190);
             lvRecentConvs.Columns.Add("스텝", 50);
-            lvRecentConvs.Columns.Add("최근 수정", 95);
+            lvRecentConvs.Columns.Add("수정 시각", 95);
 
-            lblRecentPromptTitle = new Label
-            {
-                Text = "💬 최근 전송한 프롬프트",
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                ForeColor = ColorTextWhite,
-                Location = new Point(2, 156),
-                AutoSize = true
-            };
-
-            lblRecentPromptText = new Label
-            {
-                Text = "(프롬프트 이력 로딩 중...)",
-                Font = new Font("Segoe UI", 8.0f),
-                ForeColor = Color.FromArgb(200, 210, 225),
-                BackColor = ColorBgCard,
-                Location = new Point(2, 178),
-                Size = new Size(320, 60),
-                BorderStyle = BorderStyle.FixedSingle,
-                Padding = new Padding(6)
-            };
-
-            pnlExpanded.Controls.Add(lblRecentConvTitle);
-            pnlExpanded.Controls.Add(lvRecentConvs);
-            pnlExpanded.Controls.Add(lblRecentPromptTitle);
-            pnlExpanded.Controls.Add(lblRecentPromptText);
+            pnlAdvanced.Controls.Add(lblRecentConvTitle);
+            pnlAdvanced.Controls.Add(lvRecentConvs);
 
             // Add all to Form
-            Controls.Add(pnlExpanded);
-            Controls.Add(pnlFooter);
-            Controls.Add(pnlMainCards);
+            Controls.Add(pnlAdvanced);
+            Controls.Add(btnToggleAdvanced);
+            Controls.Add(cardFiveHour);
+            Controls.Add(cardWeekly);
             Controls.Add(pnlHeader);
 
             MouseDown += Window_MouseDown;
@@ -365,7 +317,7 @@ namespace AntiGravityMeter
         {
             var card = new Panel
             {
-                BackColor = ColorBgCard,
+                BackColor = Color.FromArgb(28, 34, 46),
                 BorderStyle = BorderStyle.None
             };
             card.MouseDown += Window_MouseDown;
@@ -373,7 +325,7 @@ namespace AntiGravityMeter
             var lblIcon = new Label
             {
                 Text = icon,
-                Font = new Font("Segoe UI", 12f),
+                Font = new Font("Segoe UI", 11f),
                 Location = new Point(4, 4),
                 AutoSize = true,
                 BackColor = Color.Transparent,
@@ -384,9 +336,9 @@ namespace AntiGravityMeter
             var lblT = new Label
             {
                 Text = title,
-                Font = new Font("Segoe UI", 7.5f),
+                Font = new Font("Segoe UI", 7.2f),
                 ForeColor = ColorMutedGray,
-                Location = new Point(24, 6),
+                Location = new Point(22, 6),
                 AutoSize = true,
                 BackColor = Color.Transparent,
                 Cursor = Cursors.SizeAll
@@ -396,10 +348,10 @@ namespace AntiGravityMeter
             valLabel = new Label
             {
                 Text = initialVal,
-                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
                 ForeColor = accent,
-                Location = new Point(2, 34),
-                Size = new Size(72, 24),
+                Location = new Point(2, 30),
+                Size = new Size(77, 24),
                 TextAlign = ContentAlignment.MiddleCenter,
                 BackColor = Color.Transparent,
                 Cursor = Cursors.SizeAll
@@ -410,7 +362,6 @@ namespace AntiGravityMeter
             card.Controls.Add(lblT);
             card.Controls.Add(valLabel);
 
-            // Custom border paint for card
             card.Paint += (s, e) =>
             {
                 using var pen = new Pen(ColorBorder, 1);
@@ -420,34 +371,19 @@ namespace AntiGravityMeter
             return card;
         }
 
-        private void LblStatusBadge_Paint(object? sender, PaintEventArgs e)
-        {
-            // Draw subtle glowing pulse when BUSY
-            if (_metrics.Status == AgyStatus.Busy)
-            {
-                int alpha = (int)(160 + 90 * Math.Sin(_pulsePhase));
-                using var brush = new SolidBrush(Color.FromArgb(alpha, 46, 204, 113));
-                e.Graphics.FillRectangle(brush, lblStatusBadge.ClientRectangle);
-
-                using var textBrush = new SolidBrush(Color.FromArgb(20, 30, 20));
-                var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-                e.Graphics.DrawString("⚡ BUSY", lblStatusBadge.Font, textBrush, lblStatusBadge.ClientRectangle, sf);
-            }
-        }
-
-        private void ToggleExpandMode()
+        private void ToggleAdvancedMode()
         {
             _isExpanded = !_isExpanded;
-            btnToggleExpand.Text = _isExpanded ? "▴" : "▾";
-            pnlExpanded.Visible = _isExpanded;
+            btnToggleAdvanced.Text = _isExpanded ? "▴ 고급 통계 접기" : "▾ 고급 통계 보기 (호출/RAM/대화)";
+            pnlAdvanced.Visible = _isExpanded;
             Height = _isExpanded ? EXPANDED_HEIGHT : COMPACT_HEIGHT;
         }
 
-        private async Task RefreshDataAsync()
+        private async Task RefreshDataAsync(bool force)
         {
             try
             {
-                _metrics = await _collector.CollectMetricsAsync();
+                _metrics = await _collector.CollectMetricsAsync(force);
                 UpdateUI();
             }
             catch
@@ -463,55 +399,27 @@ namespace AntiGravityMeter
                 return;
             }
 
-            // 1. Status Badge
-            switch (_metrics.Status)
-            {
-                case AgyStatus.Busy:
-                    lblStatusBadge.Text = "⚡ BUSY";
-                    lblStatusBadge.BackColor = ColorGreenLive;
-                    lblStatusBadge.ForeColor = Color.FromArgb(15, 25, 15);
-                    break;
-                case AgyStatus.Idle:
-                    lblStatusBadge.Text = "● IDLE";
-                    lblStatusBadge.BackColor = ColorAmberIdle;
-                    lblStatusBadge.ForeColor = Color.FromArgb(20, 20, 10);
-                    break;
-                case AgyStatus.Offline:
-                default:
-                    lblStatusBadge.Text = "○ OFF";
-                    lblStatusBadge.BackColor = Color.FromArgb(60, 70, 85);
-                    lblStatusBadge.ForeColor = Color.White;
-                    break;
-            }
+            // 1. Quota Cards (Circular Donut Infographics)
+            cardWeekly.Percent = _metrics.WeeklyLimit.RemainingPercent;
+            cardWeekly.Subtitle = !string.IsNullOrEmpty(_metrics.WeeklyLimit.RefreshTimeText)
+                ? _metrics.WeeklyLimit.RefreshTimeText
+                : "it will fully refresh in 2 days, 12 hours.";
 
-            // 2. Compact Stat Cards
+            cardFiveHour.Percent = _metrics.FiveHourLimit.RemainingPercent;
+            cardFiveHour.Subtitle = !string.IsNullOrEmpty(_metrics.FiveHourLimit.RefreshTimeText)
+                ? _metrics.FiveHourLimit.RefreshTimeText
+                : "it will fully refresh in 4 hours, 40 minutes.";
+
+            lblPlanBadge.Text = _metrics.UserPlan;
+
+            // 2. Advanced View Data (Only updated if expanded or preparing)
             lblValTodayCalls.Text = $"{_metrics.TodayApiCalls}회";
             lblValTodayPrompts.Text = $"{_metrics.TodayPrompts}회";
             lblValActiveSteps.Text = $"{_metrics.ActiveConvSteps:N0}";
             lblValRam.Text = _metrics.Status != AgyStatus.Offline ? $"{_metrics.MemoryMb:F0} MB" : "0 MB";
 
-            // 3. Footer info
-            lblModelBadge.Text = $"🤖 {_metrics.ActiveModel}";
-            
-            if (_metrics.LastActivityTime != DateTime.MinValue)
-            {
-                var diff = DateTime.Now - _metrics.LastActivityTime;
-                if (diff.TotalSeconds < 60)
-                    lblLastActive.Text = "🕒 방금 전 활동";
-                else if (diff.TotalMinutes < 60)
-                    lblLastActive.Text = $"🕒 {(int)diff.TotalMinutes}분 전 활동";
-                else
-                    lblLastActive.Text = $"🕒 {_metrics.LastActivityTime:HH:mm:ss}";
-            }
-            else
-            {
-                lblLastActive.Text = "🕒 활동 없음";
-            }
-
-            // 4. Expanded Data
             if (_isExpanded)
             {
-                // Update recent conversations
                 lvRecentConvs.BeginUpdate();
                 lvRecentConvs.Items.Clear();
                 foreach (var conv in _metrics.RecentConversations)
@@ -522,18 +430,6 @@ namespace AntiGravityMeter
                     lvRecentConvs.Items.Add(item);
                 }
                 lvRecentConvs.EndUpdate();
-
-                // Update recent prompt
-                if (_metrics.RecentPrompts.Count > 0)
-                {
-                    var p = _metrics.RecentPrompts[0];
-                    string shortText = p.Text.Length > 90 ? p.Text.Substring(0, 90) + "..." : p.Text;
-                    lblRecentPromptText.Text = $"[{p.Timestamp:HH:mm:ss}]\n{shortText}";
-                }
-                else
-                {
-                    lblRecentPromptText.Text = "(기록된 프롬프트 없음)";
-                }
             }
         }
 
@@ -541,14 +437,14 @@ namespace AntiGravityMeter
         {
             _trayIcon = new NotifyIcon
             {
-                Text = "AntiGravity Meter",
+                Text = "AntiGravity Quota Meter",
                 Icon = SystemIcons.Application,
                 Visible = true
             };
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("위젯 열기", null, (s, e) => { Show(); WindowState = FormWindowState.Normal; BringToFront(); });
-            menu.Items.Add("지금 새로고침", null, async (s, e) => await RefreshDataAsync());
+            menu.Items.Add("실시간 새로고침", null, async (s, e) => await RefreshDataAsync(true));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("항상 위에 고정", null, (s, e) =>
             {
@@ -576,7 +472,6 @@ namespace AntiGravityMeter
         {
             base.OnPaint(e);
 
-            // Draw clean subtle outer border
             using var borderPen = new Pen(ColorBorder, 1.5f);
             e.Graphics.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
         }
@@ -585,8 +480,6 @@ namespace AntiGravityMeter
         {
             _pollTimer.Stop();
             _pollTimer.Dispose();
-            _animTimer.Stop();
-            _animTimer.Dispose();
             if (_trayIcon != null)
             {
                 _trayIcon.Visible = false;
