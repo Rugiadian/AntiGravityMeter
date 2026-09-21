@@ -18,24 +18,14 @@ namespace AntiGravityMeter
                 {
                     AttachConsole(-1);
                     var collector = new AgyCollector();
-                    var m = await collector.CollectMetricsAsync();
-                    Console.WriteLine("=== AgyCollector Test Results ===");
-                    Console.WriteLine($"Status: {m.Status}");
-                    Console.WriteLine($"ProcessId: {m.ProcessId}, RAM: {m.MemoryMb} MB, CPU: {m.CpuPercent}%");
-                    Console.WriteLine($"Total Conversations: {m.TotalConversations}");
-                    Console.WriteLine($"Total Steps: {m.TotalSteps}");
-                    Console.WriteLine($"Today Prompts: {m.TodayPrompts} / Total: {m.TotalPrompts}");
-                    Console.WriteLine($"Today API Calls: {m.TodayApiCalls} / Total: {m.TotalApiCalls}");
-                    Console.WriteLine($"Active Conv: {m.ActiveConvTitle} ({m.ActiveConvSteps} steps)");
-                    Console.WriteLine($"Active Model: {m.ActiveModel}");
-                    Console.WriteLine($"5-Hour Limit: {m.FiveHourLimit.RemainingPercent}% ({m.FiveHourLimit.RefreshTimeText})");
-                    Console.WriteLine($"Weekly Limit: {m.WeeklyLimit.RemainingPercent}% ({m.WeeklyLimit.RefreshTimeText})");
-                    Console.WriteLine($"Last Activity: {m.LastActivityTime:yyyy-MM-dd HH:mm:ss}");
-                    Console.WriteLine("\nRecent Conversations:");
-                    foreach (var c in m.RecentConversations)
-                    {
-                        Console.WriteLine($"  [{c.StepCount} steps] {c.Title} ({c.LastModified:MM-dd HH:mm})");
-                    }
+                    var m = await collector.CollectMetricsAsync(true);
+                    string testOutput = $"=== AntiGravity Quota Results ===\n" +
+                        $"Plan: {m.UserPlan}\n" +
+                        $"Status: {m.Status}\n" +
+                        $"Weekly Limit Remaining: {m.WeeklyLimit.RemainingPercent}% ({m.WeeklyLimit.RefreshTimeText})\n" +
+                        $"Five Hour Limit Remaining: {m.FiveHourLimit.RemainingPercent}% ({m.FiveHourLimit.RefreshTimeText})\n";
+                    File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "test_results.txt"), testOutput);
+                    Console.WriteLine(testOutput);
                     return;
                 }
 

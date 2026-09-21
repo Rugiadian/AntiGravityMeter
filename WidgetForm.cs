@@ -21,15 +21,13 @@ namespace AntiGravityMeter
         private AgyMetrics _metrics = new();
 
         // UI States
-        private bool _isExpanded = false;
         private bool _isAlwaysOnTop = true;
-        private double[] _opacities = new double[] { 0.95, 0.80, 0.60 };
+        private readonly double[] _opacities = new double[] { 0.95, 0.80, 0.60 };
         private int _opacityIdx = 0;
 
-        // Visual Constants
-        private const int COMPACT_HEIGHT = 222;
-        private const int EXPANDED_HEIGHT = 462;
+        // Visual Constants: Pure Compact Quota Widget
         private const int WIDGET_WIDTH = 360;
+        private const int WIDGET_HEIGHT = 186;
 
         // Custom Colors
         private readonly Color ColorBgDark = Color.FromArgb(20, 24, 33);
@@ -49,20 +47,9 @@ namespace AntiGravityMeter
         private Button btnClose = null!;
         private Panel pnlHeader = null!;
 
-        // Quota Cards (The Core Circular Donut Infographics from Screenshot)
+        // Core Quota Cards (Infographics from Screenshot)
         private CircularQuotaCard cardWeekly = null!;
         private CircularQuotaCard cardFiveHour = null!;
-
-        // Advanced Mode Toggle Button
-        private Button btnToggleAdvanced = null!;
-
-        // Advanced Panel (Hidden in Default Mode)
-        private Panel pnlAdvanced = null!;
-        private Label lblValTodayCalls = null!;
-        private Label lblValTodayPrompts = null!;
-        private Label lblValActiveSteps = null!;
-        private Label lblValRam = null!;
-        private ListView lvRecentConvs = null!;
 
         private NotifyIcon? _trayIcon;
 
@@ -74,8 +61,8 @@ namespace AntiGravityMeter
             InitializeComponent();
             SetupTrayIcon();
 
-            // Background Polling Timer (every 2.0 seconds)
-            _pollTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+            // Background Polling Timer (every 3.0 seconds)
+            _pollTimer = new System.Windows.Forms.Timer { Interval = 3000 };
             _pollTimer.Tick += async (s, e) => await RefreshDataAsync(false);
 
             Load += async (s, e) =>
@@ -95,7 +82,7 @@ namespace AntiGravityMeter
             Opacity = _opacities[_opacityIdx];
             DoubleBuffered = true;
             Width = WIDGET_WIDTH;
-            Height = COMPACT_HEIGHT;
+            Height = WIDGET_HEIGHT;
             BackColor = ColorBgDark;
 
             SetStyle(ControlStyles.ResizeRedraw | ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
@@ -181,110 +168,28 @@ namespace AntiGravityMeter
             pnlHeader.Controls.Add(btnRefresh);
             pnlHeader.Controls.Add(btnClose);
 
-            // 2. Circular Quota Cards (From User Screenshot)
+            // 2. Circular Quota Cards (The Core Infographics)
             cardWeekly = new CircularQuotaCard
             {
-                Location = new Point(8, 42),
-                Size = new Size(344, 64),
+                Location = new Point(8, 44),
+                Size = new Size(344, 62),
                 Title = "Weekly Limit Remaining",
-                Subtitle = "it will fully refresh in 2 days.",
-                Percent = 77
+                Subtitle = "조회 중...",
+                Percent = 100
             };
             cardWeekly.MouseDown += Window_MouseDown;
 
             cardFiveHour = new CircularQuotaCard
             {
                 Location = new Point(8, 112),
-                Size = new Size(344, 64),
+                Size = new Size(344, 62),
                 Title = "Five Hour Limit Remaining",
-                Subtitle = "it will fully refresh shortly.",
+                Subtitle = "조회 중...",
                 Percent = 100
             };
             cardFiveHour.MouseDown += Window_MouseDown;
 
-            // 3. Advanced Mode Toggle Button (Compact footer)
-            btnToggleAdvanced = new Button
-            {
-                Text = "▾ 고급 통계 보기 (호출/RAM/대화)",
-                Location = new Point(8, 182),
-                Size = new Size(344, 28),
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(28, 34, 46),
-                ForeColor = ColorMutedGray,
-                Font = new Font("Segoe UI", 8.2f),
-                Cursor = Cursors.Hand
-            };
-            btnToggleAdvanced.FlatAppearance.BorderSize = 0;
-            btnToggleAdvanced.FlatAppearance.MouseOverBackColor = Color.FromArgb(38, 46, 62);
-            btnToggleAdvanced.Click += (s, e) => ToggleAdvancedMode();
-
-            // 4. Advanced Panel (Hidden by default)
-            pnlAdvanced = new Panel
-            {
-                Location = new Point(8, 216),
-                Size = new Size(344, 235),
-                BackColor = Color.Transparent,
-                Visible = false
-            };
-
-            // Mini Stat Grid
-            int cardW = 81;
-            int cardH = 68;
-            int spacing = 6;
-
-            var cardCalls = CreateStatCard("오늘 호출", "🔥", out lblValTodayCalls, "0회", ColorAccentGold);
-            cardCalls.Location = new Point(0, 0);
-            cardCalls.Size = new Size(cardW, cardH);
-
-            var cardPrompts = CreateStatCard("프롬프트", "💬", out lblValTodayPrompts, "0회", Color.FromArgb(120, 200, 255));
-            cardPrompts.Location = new Point(cardW + spacing, 0);
-            cardPrompts.Size = new Size(cardW, cardH);
-
-            var cardSteps = CreateStatCard("세션 스텝", "🎯", out lblValActiveSteps, "0 st", Color.FromArgb(46, 204, 113));
-            cardSteps.Location = new Point((cardW + spacing) * 2, 0);
-            cardSteps.Size = new Size(cardW, cardH);
-
-            var cardRam = CreateStatCard("CLI RAM", "⚡", out lblValRam, "0 MB", Color.FromArgb(200, 160, 255));
-            cardRam.Location = new Point((cardW + spacing) * 3, 0);
-            cardRam.Size = new Size(cardW, cardH);
-
-            pnlAdvanced.Controls.Add(cardCalls);
-            pnlAdvanced.Controls.Add(cardPrompts);
-            pnlAdvanced.Controls.Add(cardSteps);
-            pnlAdvanced.Controls.Add(cardRam);
-
-            // Recent Conversations List
-            var lblRecentConvTitle = new Label
-            {
-                Text = "📋 최근 대화 세션",
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                ForeColor = ColorTextWhite,
-                Location = new Point(0, 74),
-                AutoSize = true
-            };
-
-            lvRecentConvs = new ListView
-            {
-                Location = new Point(0, 96),
-                Size = new Size(344, 134),
-                View = View.Details,
-                FullRowSelect = true,
-                BackColor = Color.FromArgb(28, 34, 46),
-                ForeColor = ColorTextWhite,
-                BorderStyle = BorderStyle.None,
-                HeaderStyle = ColumnHeaderStyle.Nonclickable,
-                Font = new Font("Segoe UI", 8.2f)
-            };
-            lvRecentConvs.Columns.Add("세션 제목", 190);
-            lvRecentConvs.Columns.Add("스텝", 50);
-            lvRecentConvs.Columns.Add("수정 시각", 95);
-
-            pnlAdvanced.Controls.Add(lblRecentConvTitle);
-            pnlAdvanced.Controls.Add(lvRecentConvs);
-
             // Add all to Form
-            Controls.Add(pnlAdvanced);
-            Controls.Add(btnToggleAdvanced);
             Controls.Add(cardFiveHour);
             Controls.Add(cardWeekly);
             Controls.Add(pnlHeader);
@@ -313,72 +218,6 @@ namespace AntiGravityMeter
             return btn;
         }
 
-        private Panel CreateStatCard(string title, string icon, out Label valLabel, string initialVal, Color accent)
-        {
-            var card = new Panel
-            {
-                BackColor = Color.FromArgb(28, 34, 46),
-                BorderStyle = BorderStyle.None
-            };
-            card.MouseDown += Window_MouseDown;
-
-            var lblIcon = new Label
-            {
-                Text = icon,
-                Font = new Font("Segoe UI", 11f),
-                Location = new Point(4, 4),
-                AutoSize = true,
-                BackColor = Color.Transparent,
-                Cursor = Cursors.SizeAll
-            };
-            lblIcon.MouseDown += Window_MouseDown;
-
-            var lblT = new Label
-            {
-                Text = title,
-                Font = new Font("Segoe UI", 7.2f),
-                ForeColor = ColorMutedGray,
-                Location = new Point(22, 6),
-                AutoSize = true,
-                BackColor = Color.Transparent,
-                Cursor = Cursors.SizeAll
-            };
-            lblT.MouseDown += Window_MouseDown;
-
-            valLabel = new Label
-            {
-                Text = initialVal,
-                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-                ForeColor = accent,
-                Location = new Point(2, 30),
-                Size = new Size(77, 24),
-                TextAlign = ContentAlignment.MiddleCenter,
-                BackColor = Color.Transparent,
-                Cursor = Cursors.SizeAll
-            };
-            valLabel.MouseDown += Window_MouseDown;
-
-            card.Controls.Add(lblIcon);
-            card.Controls.Add(lblT);
-            card.Controls.Add(valLabel);
-
-            card.Paint += (s, e) =>
-            {
-                using var pen = new Pen(ColorBorder, 1);
-                e.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1);
-            };
-
-            return card;
-        }
-
-        private void ToggleAdvancedMode()
-        {
-            _isExpanded = !_isExpanded;
-            btnToggleAdvanced.Text = _isExpanded ? "▴ 고급 통계 접기" : "▾ 고급 통계 보기 (호출/RAM/대화)";
-            pnlAdvanced.Visible = _isExpanded;
-            Height = _isExpanded ? EXPANDED_HEIGHT : COMPACT_HEIGHT;
-        }
-
         private async Task RefreshDataAsync(bool force)
         {
             try
@@ -399,38 +238,20 @@ namespace AntiGravityMeter
                 return;
             }
 
-            // 1. Quota Cards (Circular Donut Infographics)
+            // 1. Weekly Quota
             cardWeekly.Percent = _metrics.WeeklyLimit.RemainingPercent;
             cardWeekly.Subtitle = !string.IsNullOrEmpty(_metrics.WeeklyLimit.RefreshTimeText)
                 ? _metrics.WeeklyLimit.RefreshTimeText
                 : "it will fully refresh in 2 days.";
 
+            // 2. 5-Hour Quota
             cardFiveHour.Percent = _metrics.FiveHourLimit.RemainingPercent;
             cardFiveHour.Subtitle = !string.IsNullOrEmpty(_metrics.FiveHourLimit.RefreshTimeText)
                 ? _metrics.FiveHourLimit.RefreshTimeText
                 : "it will fully refresh shortly.";
 
+            // 3. User Plan
             lblPlanBadge.Text = _metrics.UserPlan;
-
-            // 2. Advanced View Data (Only updated if expanded or preparing)
-            lblValTodayCalls.Text = $"{_metrics.TodayApiCalls}회";
-            lblValTodayPrompts.Text = $"{_metrics.TodayPrompts}회";
-            lblValActiveSteps.Text = $"{_metrics.ActiveConvSteps:N0}";
-            lblValRam.Text = _metrics.Status != AgyStatus.Offline ? $"{_metrics.MemoryMb:F0} MB" : "0 MB";
-
-            if (_isExpanded)
-            {
-                lvRecentConvs.BeginUpdate();
-                lvRecentConvs.Items.Clear();
-                foreach (var conv in _metrics.RecentConversations)
-                {
-                    var item = new ListViewItem(conv.Title);
-                    item.SubItems.Add($"{conv.StepCount}");
-                    item.SubItems.Add(conv.LastModified != DateTime.MinValue ? conv.LastModified.ToString("MM-dd HH:mm") : "-");
-                    lvRecentConvs.Items.Add(item);
-                }
-                lvRecentConvs.EndUpdate();
-            }
         }
 
         private void SetupTrayIcon()
