@@ -39,7 +39,7 @@ namespace AntiGravityMeter
                      ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.ResizeRedraw, true);
 
-            Height = 62;
+            Height = 64;
             BackColor = Color.FromArgb(30, 36, 48); // Dark Slate
         }
 
@@ -65,17 +65,7 @@ namespace AntiGravityMeter
                 g.DrawRectangle(borderPen, 0, 0, rect.Width - 1, rect.Height - 1);
             }
 
-            // 2. Left Texts (Title & Subtitle)
-            using (var titleFont = new Font("Segoe UI", 9.5f, FontStyle.Bold))
-            using (var subFont = new Font("Segoe UI", 8.0f, FontStyle.Regular))
-            using (var titleBrush = new SolidBrush(Color.FromArgb(240, 244, 250)))
-            using (var subBrush = new SolidBrush(Color.FromArgb(140, 155, 175)))
-            {
-                g.DrawString(_title, titleFont, titleBrush, 12, 10);
-                g.DrawString(_subtitle, subFont, subBrush, 12, 34);
-            }
-
-            // 3. Right: Circular Ring Infographic (Donut Gauge)
+            // 2. Right: Circular Ring Infographic (Donut Gauge)
             int gaugeDiameter = 36;
             int gaugeX = rect.Width - gaugeDiameter - 12;
             int gaugeY = (rect.Height - gaugeDiameter) / 2;
@@ -108,15 +98,41 @@ namespace AntiGravityMeter
                 }
             }
 
-            // 4. Percentage Text (Left to the circular gauge)
+            // 3. Percentage Text (Left to the circular gauge)
             string pctText = $"{_percent}%";
-            using (var pctFont = new Font("Segoe UI", 13.5f, FontStyle.Bold))
+            float pctWidth = 0;
+            using (var pctFont = new Font("Segoe UI", 13f, FontStyle.Bold))
             using (var pctBrush = new SolidBrush(Color.White))
             {
                 var size = g.MeasureString(pctText, pctFont);
-                float pctX = gaugeX - size.Width - 10;
+                pctWidth = size.Width;
+                float pctX = gaugeX - size.Width - 8;
                 float pctY = (rect.Height - size.Height) / 2f;
                 g.DrawString(pctText, pctFont, pctBrush, pctX, pctY);
+            }
+
+            // 4. Left Texts (Title & Subtitle with bounds to prevent overlapping)
+            float maxTextWidth = gaugeX - pctWidth - 22;
+            if (maxTextWidth < 50) maxTextWidth = 50;
+
+            using (var titleFont = new Font("Segoe UI", 9.2f, FontStyle.Bold))
+            using (var subFont = new Font("Segoe UI", 7.8f, FontStyle.Regular))
+            using (var titleBrush = new SolidBrush(Color.FromArgb(240, 244, 250)))
+            using (var subBrush = new SolidBrush(Color.FromArgb(145, 160, 180)))
+            using (var sf = new StringFormat
+            {
+                Trimming = StringTrimming.EllipsisWord,
+                FormatFlags = StringFormatFlags.NoClip
+            })
+            {
+                var titleRect = new RectangleF(12, 10, maxTextWidth, 18);
+                g.DrawString(_title, titleFont, titleBrush, titleRect, sf);
+
+                if (!string.IsNullOrWhiteSpace(_subtitle))
+                {
+                    var subRect = new RectangleF(12, 30, maxTextWidth, 28);
+                    g.DrawString(_subtitle, subFont, subBrush, subRect, sf);
+                }
             }
         }
     }

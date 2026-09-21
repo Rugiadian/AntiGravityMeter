@@ -27,8 +27,8 @@ namespace AntiGravityMeter
         private int _opacityIdx = 0;
 
         // Visual Constants
-        private const int COMPACT_HEIGHT = 208;
-        private const int EXPANDED_HEIGHT = 445;
+        private const int COMPACT_HEIGHT = 222;
+        private const int EXPANDED_HEIGHT = 462;
         private const int WIDGET_WIDTH = 360;
 
         // Custom Colors
@@ -185,20 +185,20 @@ namespace AntiGravityMeter
             cardWeekly = new CircularQuotaCard
             {
                 Location = new Point(8, 42),
-                Size = new Size(344, 58),
+                Size = new Size(344, 64),
                 Title = "Weekly Limit Remaining",
-                Subtitle = "it will fully refresh in 2 days, 12 hours.",
-                Percent = 85
+                Subtitle = "it will fully refresh in 2 days.",
+                Percent = 77
             };
             cardWeekly.MouseDown += Window_MouseDown;
 
             cardFiveHour = new CircularQuotaCard
             {
-                Location = new Point(8, 104),
-                Size = new Size(344, 58),
+                Location = new Point(8, 112),
+                Size = new Size(344, 64),
                 Title = "Five Hour Limit Remaining",
-                Subtitle = "it will fully refresh in 4 hours, 40 minutes.",
-                Percent = 92
+                Subtitle = "it will fully refresh shortly.",
+                Percent = 100
             };
             cardFiveHour.MouseDown += Window_MouseDown;
 
@@ -206,7 +206,7 @@ namespace AntiGravityMeter
             btnToggleAdvanced = new Button
             {
                 Text = "▾ 고급 통계 보기 (호출/RAM/대화)",
-                Location = new Point(8, 168),
+                Location = new Point(8, 182),
                 Size = new Size(344, 28),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(28, 34, 46),
@@ -221,7 +221,7 @@ namespace AntiGravityMeter
             // 4. Advanced Panel (Hidden by default)
             pnlAdvanced = new Panel
             {
-                Location = new Point(8, 202),
+                Location = new Point(8, 216),
                 Size = new Size(344, 235),
                 BackColor = Color.Transparent,
                 Visible = false
@@ -403,12 +403,12 @@ namespace AntiGravityMeter
             cardWeekly.Percent = _metrics.WeeklyLimit.RemainingPercent;
             cardWeekly.Subtitle = !string.IsNullOrEmpty(_metrics.WeeklyLimit.RefreshTimeText)
                 ? _metrics.WeeklyLimit.RefreshTimeText
-                : "it will fully refresh in 2 days, 12 hours.";
+                : "it will fully refresh in 2 days.";
 
             cardFiveHour.Percent = _metrics.FiveHourLimit.RemainingPercent;
             cardFiveHour.Subtitle = !string.IsNullOrEmpty(_metrics.FiveHourLimit.RefreshTimeText)
                 ? _metrics.FiveHourLimit.RefreshTimeText
-                : "it will fully refresh in 4 hours, 40 minutes.";
+                : "it will fully refresh shortly.";
 
             lblPlanBadge.Text = _metrics.UserPlan;
 

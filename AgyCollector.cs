@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Management;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
@@ -39,6 +40,34 @@ namespace AntiGravityMeter
             public string UserName;
         }
 
+        // P/Invoke for TCP table lookup
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(
+            IntPtr pTcpTable,
+            ref int pdwSize,
+            bool bOrder,
+            int ulAf,
+            int tableClass,
+            uint reserved = 0);
+
+        private const int AF_INET = 2;
+        private const int TCP_TABLE_OWNER_PID_LISTENER = 2;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MIB_TCPROW_OWNER_PID
+        {
+            public uint state;
+            public uint localAddr;
+            public byte localPort1;
+            public byte localPort2;
+            public byte localPort3;
+            public byte localPort4;
+            public uint remoteAddr;
+            public uint remotePort;
+            public int owningPid;
+            public ushort LocalPort => (ushort)((localPort1 << 8) | localPort2);
+        }
+
         private readonly string _appDataDir;
         private readonly string _summariesDbPath;
         private readonly string _conversationsDirPath;
@@ -46,9 +75,15 @@ namespace AntiGravityMeter
         private readonly string _cliLogPath;
         private readonly string _logsDirPath;
 
-        private readonly HttpClient _httpClient;
+        private readonly HttpClient _cloudHttpClient;
+        private readonly HttpClient _lsHttpClient;
         private DateTime _lastQuotaFetchTime = DateTime.MinValue;
         private AgyMetrics _cachedMetrics = new();
+
+        // Cached Language Server Info
+        private int _cachedLsPort = 0;
+        private string? _cachedLsCsrfToken = null;
+        private int _cachedLsPid = 0;
 
         // CPU calculation helper
         private DateTime _lastCpuCheckTime = DateTime.UtcNow;
@@ -64,7 +99,14 @@ namespace AntiGravityMeter
             _cliLogPath = Path.Combine(_appDataDir, "cli.log");
             _logsDirPath = Path.Combine(_appDataDir, "log");
 
-            _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            _cloudHttpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+
+            // Local language_server uses self-signed HTTPS certificates
+            var handler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
+            };
+            _lsHttpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) };
         }
 
         public static string? GetKeyringToken()
@@ -120,10 +162,22 @@ namespace AntiGravityMeter
             // 5. API Call statistics from cli.log & log/*.log
             CollectApiCallStats(metrics);
 
-            // 6. Live Quota from Google CloudCode API
-            if (forceRefreshQuota || (DateTime.UtcNow - _lastQuotaFetchTime).TotalSeconds > 25)
+            // 6. Live Quota:
+            // Priority 1: Direct Language Server API (Exact match with Antigravity App UI)
+            // Priority 2: Fallback to Google CloudCode fetchAvailableModels API
+            bool needFetch = forceRefreshQuota || 
+                             (DateTime.UtcNow - _lastQuotaFetchTime).TotalSeconds > 5 ||
+                             _cachedMetrics.WeeklyLimit.RemainingPercent == 0;
+
+            if (needFetch)
             {
-                await FetchLiveQuotaAsync(metrics);
+                bool success = await FetchLanguageServerQuotaAsync(metrics);
+                if (!success)
+                {
+                    // Fallback to cloud API
+                    await FetchCloudLiveQuotaAsync(metrics);
+                }
+
                 _lastQuotaFetchTime = DateTime.UtcNow;
                 _cachedMetrics.FiveHourLimit = metrics.FiveHourLimit;
                 _cachedMetrics.WeeklyLimit = metrics.WeeklyLimit;
@@ -153,7 +207,232 @@ namespace AntiGravityMeter
             return metrics;
         }
 
-        private async Task FetchLiveQuotaAsync(AgyMetrics metrics)
+        /// <summary>
+        /// Fetches the exact real-time quota summary directly from the Antigravity local Language Server.
+        /// This matches 100% with the Antigravity App's "Models & Usage" screen (Weekly % & 5-Hour %).
+        /// </summary>
+        private async Task<bool> FetchLanguageServerQuotaAsync(AgyMetrics metrics)
+        {
+            try
+            {
+                // Ensure we have Language Server PID and CSRF Token
+                if (!EnsureLanguageServerInfo(out int pid, out string csrfToken))
+                {
+                    return false;
+                }
+
+                // Find the listening port
+                List<int> candidatePorts = GetProcessListeningPorts(pid);
+                // Also add standard fallback ports
+                if (!candidatePorts.Contains(9120)) candidatePorts.Insert(0, 9120);
+                if (_cachedLsPort > 0 && !candidatePorts.Contains(_cachedLsPort)) candidatePorts.Insert(0, _cachedLsPort);
+
+                foreach (int port in candidatePorts)
+                {
+                    try
+                    {
+                        string url = $"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+                        using var req = new HttpRequestMessage(HttpMethod.Post, url);
+                        req.Headers.Add("x-codeium-csrf-token", csrfToken);
+                        req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+
+                        using var resp = await _lsHttpClient.SendAsync(req);
+                        if (!resp.IsSuccessStatusCode) continue;
+
+                        string json = await resp.Content.ReadAsStringAsync();
+                        using var doc = JsonDocument.Parse(json);
+
+                        if (!doc.RootElement.TryGetProperty("response", out var respProp) ||
+                            !respProp.TryGetProperty("groups", out var groupsProp))
+                        {
+                            continue;
+                        }
+
+                        _cachedLsPort = port;
+
+                        // Parse groups for "Gemini Models"
+                        foreach (var group in groupsProp.EnumerateArray())
+                        {
+                            string dispName = group.TryGetProperty("displayName", out var dp) ? dp.GetString() ?? "" : "";
+                            if (!dispName.Contains("Gemini", StringComparison.OrdinalIgnoreCase)) continue;
+
+                            if (group.TryGetProperty("buckets", out var bucketsProp))
+                            {
+                                foreach (var bucket in bucketsProp.EnumerateArray())
+                                {
+                                    string window = bucket.TryGetProperty("window", out var winProp) ? winProp.GetString() ?? "" : "";
+                                    string bucketId = bucket.TryGetProperty("bucketId", out var bIdProp) ? bIdProp.GetString() ?? "" : "";
+                                    double remFraction = bucket.TryGetProperty("remainingFraction", out var rfProp) ? rfProp.GetDouble() : 1.0;
+                                    string desc = bucket.TryGetProperty("description", out var descProp) ? descProp.GetString() ?? "" : "";
+                                    string resetTimeStr = bucket.TryGetProperty("resetTime", out var rtProp) ? rtProp.GetString() ?? "" : "";
+
+                                    DateTime resetTimeUtc = DateTime.MinValue;
+                                    if (DateTime.TryParse(resetTimeStr, out var parsedDt))
+                                    {
+                                        resetTimeUtc = parsedDt.ToUniversalTime();
+                                    }
+
+                                    int pct = Math.Clamp((int)Math.Round(remFraction * 100.0), 0, 100);
+
+                                    // Format clean refresh time text
+                                    string refreshText = FormatRefreshText(desc, resetTimeUtc);
+
+                                    if (window == "weekly" || bucketId.Contains("weekly", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        metrics.WeeklyLimit.RemainingPercent = pct;
+                                        metrics.WeeklyLimit.ResetTime = resetTimeUtc.ToLocalTime();
+                                        metrics.WeeklyLimit.RefreshTimeText = refreshText;
+                                        metrics.WeeklyLimit.Description = desc;
+                                    }
+                                    else if (window == "5h" || bucketId.Contains("5h", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        metrics.FiveHourLimit.RemainingPercent = pct;
+                                        metrics.FiveHourLimit.ResetTime = resetTimeUtc.ToLocalTime();
+                                        metrics.FiveHourLimit.RefreshTimeText = refreshText;
+                                        metrics.FiveHourLimit.Description = desc;
+                                    }
+                                }
+                            }
+
+                            return true; // Successfully updated Gemini Models quota
+                        }
+                    }
+                    catch
+                    {
+                        // Try next port
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        private static string FormatRefreshText(string fullDescription, DateTime resetTimeUtc)
+        {
+            if (string.IsNullOrWhiteSpace(fullDescription))
+            {
+                if (resetTimeUtc != DateTime.MinValue)
+                {
+                    var span = resetTimeUtc - DateTime.UtcNow;
+                    if (span.TotalDays >= 1)
+                        return $"it will fully refresh in {(int)span.TotalDays} days, {span.Hours} hours.";
+                    if (span.TotalHours >= 1)
+                        return $"it will fully refresh in {(int)span.TotalHours} hours, {span.Minutes} minutes.";
+                    if (span.TotalMinutes > 0)
+                        return $"it will fully refresh in {span.Minutes} minutes.";
+                }
+                return "it will fully refresh shortly.";
+            }
+
+            // Extract the "it will fully refresh in..." part if present
+            int idx = fullDescription.IndexOf("it will fully refresh in", StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0)
+            {
+                return fullDescription.Substring(idx).TrimEnd('.');
+            }
+
+            return fullDescription;
+        }
+
+        /// <summary>
+        /// Locates running language_server.exe and extracts the CSRF token from its command line.
+        /// </summary>
+        private bool EnsureLanguageServerInfo(out int pid, out string csrfToken)
+        {
+            pid = 0;
+            csrfToken = "";
+
+            // Check if cached PID is still alive
+            if (_cachedLsPid > 0 && !string.IsNullOrEmpty(_cachedLsCsrfToken))
+            {
+                try
+                {
+                    var p = Process.GetProcessById(_cachedLsPid);
+                    if (!p.HasExited && p.ProcessName.Contains("language_server", StringComparison.OrdinalIgnoreCase))
+                    {
+                        pid = _cachedLsPid;
+                        csrfToken = _cachedLsCsrfToken;
+                        return true;
+                    }
+                }
+                catch
+                {
+                    _cachedLsPid = 0;
+                    _cachedLsCsrfToken = null;
+                }
+            }
+
+            try
+            {
+                using var searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'language_server.exe'");
+
+                foreach (ManagementObject mo in searcher.Get())
+                {
+                    string? cmdLine = mo["CommandLine"]?.ToString();
+                    if (string.IsNullOrEmpty(cmdLine)) continue;
+
+                    var match = Regex.Match(cmdLine, @"--csrf_token\s+([a-zA-Z0-9\-]+)");
+                    if (match.Success)
+                    {
+                        pid = Convert.ToInt32(mo["ProcessId"]);
+                        csrfToken = match.Groups[1].Value;
+
+                        _cachedLsPid = pid;
+                        _cachedLsCsrfToken = csrfToken;
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Retrieves all TCP listening ports owned by a specific process ID using Win32 API.
+        /// </summary>
+        private static List<int> GetProcessListeningPorts(int pid)
+        {
+            var ports = new List<int>();
+            if (pid <= 0) return ports;
+
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER);
+
+            IntPtr pTcpTable = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (GetExtendedTcpTable(pTcpTable, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER) == 0)
+                {
+                    int rowCount = Marshal.ReadInt32(pTcpTable);
+                    IntPtr rowPtr = IntPtr.Add(pTcpTable, sizeof(int));
+                    int rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
+
+                    for (int i = 0; i < rowCount; i++)
+                    {
+                        var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
+                        if (row.owningPid == pid)
+                        {
+                            ports.Add(row.LocalPort);
+                        }
+                        rowPtr = IntPtr.Add(rowPtr, rowSize);
+                    }
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pTcpTable);
+            }
+
+            return ports;
+        }
+
+        private async Task FetchCloudLiveQuotaAsync(AgyMetrics metrics)
         {
             string? token = GetKeyringToken();
             if (string.IsNullOrEmpty(token)) return;
@@ -165,7 +444,7 @@ namespace AntiGravityMeter
                 req.Headers.Add("User-Agent", "antigravity-cli");
                 req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
 
-                using var resp = await _httpClient.SendAsync(req);
+                using var resp = await _cloudHttpClient.SendAsync(req);
                 if (resp.IsSuccessStatusCode)
                 {
                     string json = await resp.Content.ReadAsStringAsync();
@@ -173,7 +452,6 @@ namespace AntiGravityMeter
 
                     if (doc.RootElement.TryGetProperty("models", out var modelsProp))
                     {
-                        // Look for primary Gemini model quotaInfo
                         foreach (var prop in modelsProp.EnumerateObject())
                         {
                             string modelName = prop.Name;
@@ -196,43 +474,10 @@ namespace AntiGravityMeter
 
                                 int percent = Math.Clamp((int)Math.Round(remaining * 100.0), 0, 100);
 
-                                // 5-Hour Limit
                                 metrics.FiveHourLimit.RemainingPercent = percent;
                                 metrics.FiveHourLimit.ResetTime = resetTimeUtc.ToLocalTime();
-
-                                if (resetTimeUtc != DateTime.MinValue)
-                                {
-                                    var span = resetTimeUtc - DateTime.UtcNow;
-                                    if (span.TotalMinutes > 0)
-                                    {
-                                        if (span.TotalHours >= 1)
-                                            metrics.FiveHourLimit.RefreshTimeText = $"it will fully refresh in {(int)span.TotalHours} hours, {span.Minutes} minutes.";
-                                        else
-                                            metrics.FiveHourLimit.RefreshTimeText = $"it will fully refresh in {span.Minutes} minutes.";
-                                    }
-                                    else
-                                    {
-                                        metrics.FiveHourLimit.RefreshTimeText = "it will fully refresh shortly.";
-                                    }
-                                }
-
-                                // Weekly Limit (Pro tier has weekly allowance)
-                                // Weekly is typically higher than 5-hour, or proportional
-                                int weeklyPercent = Math.Clamp((int)Math.Round(Math.Min(100.0, percent + 7.0)), 0, 100);
-                                metrics.WeeklyLimit.RemainingPercent = weeklyPercent;
-
-                                // Estimate weekly refresh
-                                var weeklySpan = resetTimeUtc.AddDays(2.5) - DateTime.UtcNow;
-                                if (weeklySpan.TotalDays >= 1)
-                                {
-                                    metrics.WeeklyLimit.RefreshTimeText = $"it will fully refresh in {(int)weeklySpan.TotalDays} days, {weeklySpan.Hours} hours.";
-                                }
-                                else
-                                {
-                                    metrics.WeeklyLimit.RefreshTimeText = "it will fully refresh in 2 days, 12 hours.";
-                                }
-
-                                break; // Handled primary Gemini model
+                                metrics.FiveHourLimit.RefreshTimeText = FormatRefreshText("", resetTimeUtc);
+                                break;
                             }
                         }
                     }
@@ -240,7 +485,6 @@ namespace AntiGravityMeter
             }
             catch
             {
-                // Fallback to cached
             }
         }
 
@@ -248,44 +492,59 @@ namespace AntiGravityMeter
         {
             try
             {
-                var procs = Process.GetProcessesByName("agy");
+                var procs = Process.GetProcessesByName("antigravity");
                 if (procs.Length == 0)
                 {
-                    procs = Process.GetProcessesByName("Antigravity");
+                    procs = Process.GetProcessesByName("node");
                 }
 
-                if (procs.Length > 0)
-                {
-                    var mainProc = procs[0];
-                    metrics.Status = AgyStatus.Idle;
-                    metrics.ProcessId = mainProc.Id;
+                Process? targetProc = null;
+                double maxMem = 0;
 
-                    mainProc.Refresh();
-                    metrics.MemoryMb = Math.Round(mainProc.WorkingSet64 / (1024.0 * 1024.0), 1);
+                foreach (var p in procs)
+                {
+                    try
+                    {
+                        if (p.WorkingSet64 > maxMem)
+                        {
+                            maxMem = p.WorkingSet64;
+                            targetProc = p;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (targetProc != null)
+                {
+                    metrics.ProcessId = targetProc.Id;
+                    metrics.MemoryMb = targetProc.WorkingSet64 / (1024.0 * 1024.0);
 
                     var now = DateTime.UtcNow;
-                    var cpuTime = mainProc.TotalProcessorTime;
-                    var timeSpan = now - _lastCpuCheckTime;
+                    var totalTime = targetProc.TotalProcessorTime;
 
-                    if (timeSpan.TotalMilliseconds > 500 && _lastCpuTotalTime != TimeSpan.Zero)
+                    if (_lastCpuCheckTime != DateTime.MinValue && now > _lastCpuCheckTime)
                     {
-                        double cpuUsed = (cpuTime - _lastCpuTotalTime).TotalMilliseconds;
-                        double totalAvailable = timeSpan.TotalMilliseconds * Environment.ProcessorCount;
-                        metrics.CpuPercent = Math.Clamp(Math.Round((cpuUsed / totalAvailable) * 100.0, 1), 0.0, 100.0);
+                        double elapsedMs = (now - _lastCpuCheckTime).TotalMilliseconds;
+                        double cpuMs = (totalTime - _lastCpuTotalTime).TotalMilliseconds;
+                        int cpuCount = Environment.ProcessorCount;
+                        if (elapsedMs > 0 && cpuCount > 0)
+                        {
+                            metrics.CpuPercent = Math.Clamp((cpuMs / (elapsedMs * cpuCount)) * 100.0, 0, 100);
+                        }
                     }
 
                     _lastCpuCheckTime = now;
-                    _lastCpuTotalTime = cpuTime;
+                    _lastCpuTotalTime = totalTime;
+                    metrics.Status = AgyStatus.Idle;
                 }
                 else
                 {
                     metrics.Status = AgyStatus.Offline;
-                    metrics.MemoryMb = 0;
-                    metrics.CpuPercent = 0;
                 }
             }
             catch
             {
+                metrics.Status = AgyStatus.Offline;
             }
         }
 
@@ -295,73 +554,44 @@ namespace AntiGravityMeter
 
             try
             {
-                var connStr = $"Data Source={_summariesDbPath};Mode=ReadOnly;Cache=Shared";
-                using var conn = new SqliteConnection(connStr);
+                using var conn = new SqliteConnection($"Data Source={_summariesDbPath};Mode=ReadOnly;");
                 conn.Open();
 
                 using (var cmd = conn.CreateCommand())
                 {
-                    cmd.CommandText = "SELECT COUNT(*), COALESCE(SUM(step_count), 0) FROM conversation_summaries;";
-                    using var reader = cmd.ExecuteReader();
-                    if (reader.Read())
-                    {
-                        metrics.TotalConversations = reader.GetInt32(0);
-                        metrics.TotalSteps = reader.GetInt32(1);
-                    }
+                    cmd.CommandText = "SELECT COUNT(*) FROM summaries";
+                    metrics.TotalConversations = Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
                 }
 
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.CommandText = @"
-                        SELECT conversation_id, title, preview, step_count, last_modified_time 
-                        FROM conversation_summaries 
-                        ORDER BY last_modified_time DESC 
-                        LIMIT 6;";
-                    using var reader = cmd.ExecuteReader();
-                    metrics.RecentConversations.Clear();
+                        SELECT conversation_id, title, preview, step_count, last_modified
+                        FROM summaries
+                        ORDER BY last_modified DESC
+                        LIMIT 5";
 
-                    bool first = true;
+                    using var reader = cmd.ExecuteReader();
                     while (reader.Read())
                     {
-                        string id = reader.IsDBNull(0) ? "" : reader.GetString(0);
-                        string title = reader.IsDBNull(1) ? "" : reader.GetString(1);
-                        string preview = reader.IsDBNull(2) ? "" : reader.GetString(2);
-                        int steps = reader.IsDBNull(3) ? 0 : reader.GetInt32(3);
-                        DateTime modTime = DateTime.MinValue;
+                        var item = new ConvSummaryItem
+                        {
+                            Id = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                            Title = reader.IsDBNull(1) ? "" : reader.GetString(1),
+                            Preview = reader.IsDBNull(2) ? "" : reader.GetString(2),
+                            StepCount = reader.IsDBNull(3) ? 0 : reader.GetInt32(3),
+                        };
 
                         if (!reader.IsDBNull(4))
                         {
-                            if (DateTime.TryParse(reader.GetString(4), out var dt))
+                            long unixEpoch = reader.GetInt64(4);
+                            if (unixEpoch > 0)
                             {
-                                modTime = dt.ToLocalTime();
+                                item.LastModified = DateTimeOffset.FromUnixTimeSeconds(unixEpoch).LocalDateTime;
                             }
                         }
 
-                        if (string.IsNullOrWhiteSpace(title))
-                        {
-                            title = string.IsNullOrWhiteSpace(preview) ? id : preview;
-                        }
-
-                        if (first)
-                        {
-                            metrics.ActiveConvId = id;
-                            metrics.ActiveConvTitle = title;
-                            metrics.ActiveConvSteps = steps;
-                            if (modTime > metrics.LastActivityTime)
-                            {
-                                metrics.LastActivityTime = modTime;
-                            }
-                            first = false;
-                        }
-
-                        metrics.RecentConversations.Add(new ConvSummaryItem
-                        {
-                            Id = id,
-                            Title = title,
-                            Preview = preview,
-                            StepCount = steps,
-                            LastModified = modTime
-                        });
+                        metrics.RecentConversations.Add(item);
                     }
                 }
             }
@@ -372,27 +602,58 @@ namespace AntiGravityMeter
 
         private void CollectActiveConversationDetails(AgyMetrics metrics)
         {
-            if (string.IsNullOrEmpty(metrics.ActiveConvId)) return;
-
-            string convDb = Path.Combine(_conversationsDirPath, $"{metrics.ActiveConvId}.db");
-            if (!File.Exists(convDb)) return;
+            if (!Directory.Exists(_conversationsDirPath)) return;
 
             try
             {
-                var connStr = $"Data Source={convDb};Mode=ReadOnly;Cache=Shared";
-                using var conn = new SqliteConnection(connStr);
-                conn.Open();
+                var dirInfo = new DirectoryInfo(_conversationsDirPath);
+                FileInfo? latestFile = null;
 
-                using var cmd = conn.CreateCommand();
-                cmd.CommandText = "SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1;";
-                var blob = cmd.ExecuteScalar() as byte[];
-                if (blob != null && blob.Length > 0)
+                foreach (var file in dirInfo.GetFiles("*.jsonl"))
                 {
-                    string text = Encoding.ASCII.GetString(blob);
-                    var match = Regex.Match(text, @"(gemini-[0-9\.]+[a-zA-Z0-9_\-]*|claude-[0-9\.]+[a-zA-Z0-9_\-]*)");
-                    if (match.Success)
+                    if (latestFile == null || file.LastWriteTimeUtc > latestFile.LastWriteTimeUtc)
                     {
-                        metrics.ActiveModel = match.Value;
+                        latestFile = file;
+                    }
+                }
+
+                if (latestFile != null)
+                {
+                    metrics.ActiveConvId = Path.GetFileNameWithoutExtension(latestFile.Name);
+                    metrics.LastActivityTime = latestFile.LastWriteTime;
+
+                    if (metrics.RecentConversations.Count > 0 && metrics.RecentConversations[0].Id == metrics.ActiveConvId)
+                    {
+                        metrics.ActiveConvTitle = metrics.RecentConversations[0].Title;
+                    }
+
+                    int stepCount = 0;
+                    string lastModel = "";
+
+                    using (var fs = new FileStream(latestFile.FullName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var reader = new StreamReader(fs, Encoding.UTF8))
+                    {
+                        string? line;
+                        while ((line = reader.ReadLine()) != null)
+                        {
+                            if (string.IsNullOrWhiteSpace(line)) continue;
+                            stepCount++;
+
+                            if (line.Contains("\"model\""))
+                            {
+                                var match = Regex.Match(line, @"""model""\s*:\s*""([^""]+)""");
+                                if (match.Success)
+                                {
+                                    lastModel = match.Groups[1].Value;
+                                }
+                            }
+                        }
+                    }
+
+                    metrics.ActiveConvSteps = stepCount;
+                    if (!string.IsNullOrEmpty(lastModel))
+                    {
+                        metrics.ActiveModel = lastModel;
                     }
                 }
             }
@@ -407,68 +668,40 @@ namespace AntiGravityMeter
 
             try
             {
-                using var fs = new FileStream(_historyJsonlPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var reader = new StreamReader(fs, Encoding.UTF8);
+                int total = 0;
+                int today = 0;
+                var todayDate = DateTime.Today;
 
-                string? line;
-                int totalPrompts = 0;
-                int todayPrompts = 0;
-                var today = DateTime.Today;
-                var recentList = new List<PromptHistoryItem>();
-
-                while ((line = reader.ReadLine()) != null)
+                using (var fs = new FileStream(_historyJsonlPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var reader = new StreamReader(fs, Encoding.UTF8))
                 {
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    totalPrompts++;
-
-                    try
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
                     {
-                        using var doc = JsonDocument.Parse(line);
-                        var root = doc.RootElement;
-                        long ts = 0;
-                        if (root.TryGetProperty("timestamp", out var tsProp))
+                        if (string.IsNullOrWhiteSpace(line)) continue;
+                        total++;
+
+                        try
                         {
-                            ts = tsProp.GetInt64();
-                        }
-
-                        DateTime itemTime = ts > 0 
-                            ? DateTimeOffset.FromUnixTimeMilliseconds(ts).LocalDateTime 
-                            : DateTime.MinValue;
-
-                        if (itemTime >= today)
-                        {
-                            todayPrompts++;
-                        }
-
-                        string text = root.TryGetProperty("display", out var dispProp) ? dispProp.GetString() ?? "" : "";
-                        string convId = root.TryGetProperty("conversationId", out var cProp) ? cProp.GetString() ?? "" : "";
-
-                        if (!string.IsNullOrWhiteSpace(text))
-                        {
-                            recentList.Add(new PromptHistoryItem
+                            using var doc = JsonDocument.Parse(line);
+                            var root = doc.RootElement;
+                            if (root.TryGetProperty("timestamp", out var tsProp))
                             {
-                                Text = text,
-                                Timestamp = itemTime,
-                                ConversationId = convId
-                            });
-
-                            if (itemTime > metrics.LastActivityTime)
-                            {
-                                metrics.LastActivityTime = itemTime;
+                                if (DateTime.TryParse(tsProp.GetString(), out var dt))
+                                {
+                                    if (dt.ToLocalTime().Date == todayDate)
+                                    {
+                                        today++;
+                                    }
+                                }
                             }
                         }
-                    }
-                    catch
-                    {
+                        catch { }
                     }
                 }
 
-                metrics.TotalPrompts = totalPrompts;
-                metrics.TodayPrompts = todayPrompts;
-
-                recentList.Reverse();
-                if (recentList.Count > 5) recentList.RemoveRange(5, recentList.Count - 5);
-                metrics.RecentPrompts = recentList;
+                metrics.TotalPrompts = total;
+                metrics.TodayPrompts = today;
             }
             catch
             {
@@ -477,68 +710,36 @@ namespace AntiGravityMeter
 
         private void CollectApiCallStats(AgyMetrics metrics)
         {
-            int todayCalls = 0;
-            int totalCalls = 0;
-            var todayStr = DateTime.Now.ToString("MMdd");
-
-            if (File.Exists(_cliLogPath))
-            {
-                CountCallsInLogFile(_cliLogPath, todayStr, ref todayCalls, ref totalCalls, metrics);
-            }
-
-            if (Directory.Exists(_logsDirPath))
-            {
-                try
-                {
-                    var dirInfo = new DirectoryInfo(_logsDirPath);
-                    var logFiles = dirInfo.GetFiles("cli-*.log");
-                    foreach (var f in logFiles)
-                    {
-                        if (f.FullName == _cliLogPath) continue;
-                        CountCallsInLogFile(f.FullName, todayStr, ref todayCalls, ref totalCalls, metrics);
-                    }
-                }
-                catch
-                {
-                }
-            }
-
-            metrics.TodayApiCalls = todayCalls;
-            metrics.TotalApiCalls = totalCalls;
-        }
-
-        private void CountCallsInLogFile(string path, string todayStr, ref int todayCount, ref int totalCount, AgyMetrics metrics)
-        {
             try
             {
-                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var reader = new StreamReader(fs, Encoding.UTF8);
+                int totalCalls = 0;
+                int todayCalls = 0;
+                var todayDate = DateTime.Today;
 
-                string? line;
-                while ((line = reader.ReadLine()) != null)
+                if (File.Exists(_cliLogPath))
                 {
-                    if (line.Contains("streamGenerateContent"))
+                    var fileInfo = new FileInfo(_cliLogPath);
+                    if (fileInfo.Length < 100 * 1024 * 1024)
                     {
-                        totalCount++;
-                        if (line.Length > 5 && line.Substring(1, 4) == todayStr)
+                        using var fs = new FileStream(_cliLogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        using var reader = new StreamReader(fs, Encoding.UTF8);
+                        string? line;
+                        while ((line = reader.ReadLine()) != null)
                         {
-                            todayCount++;
-                        }
-
-                        if (line.Length >= 22 && line[0] == 'I')
-                        {
-                            string timePart = line.Substring(6, 8);
-                            if (TimeSpan.TryParse(timePart, out var ts))
+                            if (line.Contains("Sending request to") || line.Contains("StreamGenerateContent") || line.Contains("googleapis.com"))
                             {
-                                var logTime = DateTime.Today.Add(ts);
-                                if (logTime > metrics.LastActivityTime)
+                                totalCalls++;
+                                if (line.Length > 20 && DateTime.TryParse(line.Substring(0, 19), out var dt))
                                 {
-                                    metrics.LastActivityTime = logTime;
+                                    if (dt.ToLocalTime().Date == todayDate) todayCalls++;
                                 }
                             }
                         }
                     }
                 }
+
+                metrics.TotalApiCalls = totalCalls;
+                metrics.TodayApiCalls = todayCalls;
             }
             catch
             {
