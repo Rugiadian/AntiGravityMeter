@@ -29,7 +29,7 @@ namespace AntiGravityMeter
 
         // Visual Constants: 1/2 Compact Quota Widget
         private const int WIDGET_WIDTH = 256;
-        private const int WIDGET_HEIGHT = 100;
+        private const int WIDGET_HEIGHT = 208;
         private const int CARD_HEIGHT = 28;
         private const int ROW_HEIGHT = 18;
 
@@ -243,50 +243,62 @@ namespace AntiGravityMeter
                 _metrics = await _collector.CollectMetricsAsync(force);
                 UpdateUI();
             }
-            catch
+            catch (Exception ex)
             {
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), "[RefreshDataAsync] " + ex + "\n"); } catch { }
             }
         }
 
         private void UpdateUI()
         {
-            if (InvokeRequired)
+            try
             {
-                BeginInvoke(new Action(UpdateUI));
-                return;
-            }
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action(UpdateUI));
+                    return;
+                }
 
-            // 1. Rebuild the card/row layout only when groups, buckets or models change
-            string signature = BuildLayoutSignature();
-            if (signature != _layoutSignature)
+                // 1. Rebuild the card/row layout only when groups, buckets or models change
+                string signature = BuildLayoutSignature();
+                if (signature != _layoutSignature)
+                {
+                    _layoutSignature = signature;
+                    RebuildLayout();
+                }
+
+                // 2. Quota group cards (Weekly / 5-Hour per group)
+                foreach (var (card, gi, bi) in _cards)
+                {
+                    if (gi >= _metrics.Groups.Count || bi >= _metrics.Groups[gi].Buckets.Count) continue;
+                    var bucket = _metrics.Groups[gi].Buckets[bi];
+                    card.Percent = bucket.RemainingPercent;
+                    card.ResetTime = bucket.ResetTime;
+                    card.Subtitle = !string.IsNullOrEmpty(bucket.RefreshTimeText)
+                        ? bucket.RefreshTimeText
+                        : (bucket.RemainingPercent >= 100 ? "한도 여유" : "곧 리셋");
+                    if (card.ResetTime != DateTime.MinValue)
+                    {
+                        card.Invalidate();
+                    }
+                }
+
+                // 3. Per-model usage rows
+                foreach (var (row, mi) in _modelRows)
+                {
+                    if (mi >= _metrics.Models.Count) continue;
+                    var m = _metrics.Models[mi];
+                    row.Percent = m.RemainingPercent;
+                    row.ResetTime = m.ResetTime;
+                }
+
+                // 4. User Plan
+                lblPlanBadge.Text = _metrics.UserPlan;
+            }
+            catch (Exception ex)
             {
-                _layoutSignature = signature;
-                RebuildLayout();
+                try { System.IO.File.AppendAllText(System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), "[UpdateUI] " + ex + "\n"); } catch { }
             }
-
-            // 2. Quota group cards (Weekly / 5-Hour per group)
-            foreach (var (card, gi, bi) in _cards)
-            {
-                if (gi >= _metrics.Groups.Count || bi >= _metrics.Groups[gi].Buckets.Count) continue;
-                var bucket = _metrics.Groups[gi].Buckets[bi];
-                card.Percent = bucket.RemainingPercent;
-                card.ResetTime = bucket.ResetTime;
-                card.Subtitle = !string.IsNullOrEmpty(bucket.RefreshTimeText)
-                    ? bucket.RefreshTimeText
-                    : "it will fully refresh shortly.";
-            }
-
-            // 3. Per-model usage rows
-            foreach (var (row, mi) in _modelRows)
-            {
-                if (mi >= _metrics.Models.Count) continue;
-                var m = _metrics.Models[mi];
-                row.Percent = m.RemainingPercent;
-                row.ResetTime = m.ResetTime;
-            }
-
-            // 4. User Plan
-            lblPlanBadge.Text = _metrics.UserPlan;
         }
 
         private string BuildLayoutSignature()
@@ -433,11 +445,11 @@ namespace AntiGravityMeter
 
         private static string ShortBucketTitle(ModelQuotaItem bucket) => bucket.Window switch
         {
-            "weekly" => "주간",
+            "weekly" => "위클리",
             "5h" => "5시간",
-            _ => bucket.Title.Contains("Weekly", StringComparison.OrdinalIgnoreCase) ? "주간"
+            _ => bucket.Title.Contains("Weekly", StringComparison.OrdinalIgnoreCase) ? "위클리"
                : bucket.Title.Contains("Five Hour", StringComparison.OrdinalIgnoreCase) ? "5시간"
-               : "남은량"
+               : "위클리"
         };
 
         private Label CreateSectionLabel(string text, int y)

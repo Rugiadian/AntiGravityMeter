@@ -14,8 +14,8 @@ Google Antigravity의 실제 모델 사용량(Weekly & 5-Hour Limit Quota)을 �
 - **동그라미 도넛 게이지 인포그래픽 (`CircularQuotaCard`)**:
   - 원형 링 게이지 & 큼직한 퍼센트(%) 표시
   - 잔여량에 따른 직관적 컬러 변화 (초록 70%+ / 주황 30%+ / 빨강 30% 미만)
-- **모든 쿼터 그룹 표시**: `retrieveUserQuotaSummary`가 반환하는 모든 그룹(예: *Claude and GPT models*)의 Weekly / 5-Hour 한도를 그룹별 섹션으로 표시
-  - 요약 API에 없는 그룹(예: *Gemini models*)은 `fetchAvailableModels`의 모델별 `quotaInfo`로 계산하여 표시 (그룹 이름에 마우스를 올리면 포함 모델 목록 툴팁)
+- **모든 쿼터 그룹 표시**: Gemini Models 및 Claude and GPT models 그룹의 위클리(Weekly) 및 5시간(5-Hour) 한도를 항상 누락 없이 실시간 게이지 카드로 완벽 표시
+  - 요약 API에 미포함된 그룹/주기는 `fetchAvailableModels`의 모델별 `quotaInfo` 및 풀 상태를 분석하여 자동 보정 (5시간 주기 미제한 시 '한도 여유 (100%)' 표시)
 - **모델별 사용량 (Per-Model Usage)**: `fetchAvailableModels` 기반으로 사용 가능한 모든 모델(Gemini, Claude, GPT-OSS 등)의 잔여량 바 / % / 리셋까지 남은 시간 표시
   - Low / Medium / High 등 effort 변형은 하나의 모델로 병합
   - 헤더의 **☰ 버튼**으로 목록 펼치기/접기 (위젯 높이 자동 조정, 하단 위치 고정)

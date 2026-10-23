@@ -15,7 +15,7 @@ namespace AntiGravityMeter
     {
         private static readonly CultureInfo Ko = CultureInfo.GetCultureInfo("ko-KR");
 
-        private string _title = "주간";
+        private string _title = "위클리";
         private string _subtitle = "";
         private int _percent = 100;
         private DateTime _resetTime = DateTime.MinValue;

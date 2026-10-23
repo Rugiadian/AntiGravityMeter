@@ -164,6 +164,8 @@ namespace AntiGravityMeter
                     metrics.Groups = _cachedMetrics.Groups;
                 }
 
+                EnsureStandardGroupsAndBuckets(metrics, models);
+
                 SyncLegacyGeminiLimits(metrics);
 
                 _lastQuotaFetchTime = DateTime.UtcNow;
@@ -430,61 +432,177 @@ namespace AntiGravityMeter
         }
 
         /// <summary>
-        /// The quota summary currently only reports some pools (e.g. "Claude and GPT models").
-        /// Pools that are missing are synthesized from per-model quotaInfo.
+        /// Ensures both "Gemini Models" and "Claude and GPT models" groups are always present,
+        /// and each group always displays both Weekly ("weekly") and 5-Hour ("5h") limit buckets.
         /// </summary>
+        private static void EnsureStandardGroupsAndBuckets(AgyMetrics metrics, List<ModelUsage> models)
+        {
+            var geminiModels = models.FindAll(m => m.Provider.Equals("Google", StringComparison.OrdinalIgnoreCase));
+            var claudeGptModels = models.FindAll(m => !m.Provider.Equals("Google", StringComparison.OrdinalIgnoreCase));
+
+            // 1. Ensure Gemini group exists
+            var geminiGroup = metrics.Groups.Find(g => g.Name.Contains("Gemini", StringComparison.OrdinalIgnoreCase));
+            if (geminiGroup == null)
+            {
+                geminiGroup = new QuotaGroup
+                {
+                    Name = "Gemini Models",
+                    IsSynthesized = true,
+                    Description = "Models within this group: " + (geminiModels.Count > 0
+                        ? string.Join(", ", geminiModels.ConvertAll(m => m.DisplayName))
+                        : "Gemini Flash, Gemini Pro")
+                };
+                metrics.Groups.Insert(0, geminiGroup);
+            }
+            else if (string.IsNullOrWhiteSpace(geminiGroup.Name) || geminiGroup.Name.Equals("Gemini models", StringComparison.Ordinal))
+            {
+                geminiGroup.Name = "Gemini Models";
+            }
+
+            // 2. Ensure Claude & GPT group exists
+            var claudeGroup = metrics.Groups.Find(g => g.Name.Contains("Claude", StringComparison.OrdinalIgnoreCase) ||
+                                                       g.Name.Contains("GPT", StringComparison.OrdinalIgnoreCase));
+            if (claudeGroup == null)
+            {
+                claudeGroup = new QuotaGroup
+                {
+                    Name = "Claude and GPT models",
+                    IsSynthesized = true,
+                    Description = "Models within this group: " + (claudeGptModels.Count > 0
+                        ? string.Join(", ", claudeGptModels.ConvertAll(m => m.DisplayName))
+                        : "Claude Opus, Claude Sonnet, GPT-OSS")
+                };
+                metrics.Groups.Add(claudeGroup);
+            }
+            else if (string.IsNullOrWhiteSpace(claudeGroup.Name))
+            {
+                claudeGroup.Name = "Claude and GPT models";
+            }
+
+            // 3. For each group, ensure both Weekly and 5-Hour buckets are always present
+            foreach (var group in metrics.Groups)
+            {
+                bool isGemini = group.Name.Contains("Gemini", StringComparison.OrdinalIgnoreCase);
+                var groupModels = isGemini ? geminiModels : claudeGptModels;
+                EnsureBucketsForGroup(group, groupModels);
+            }
+
+            // 4. Sort groups: Gemini first, Claude & GPT second, others after
+            metrics.Groups.Sort((a, b) => GroupRank(a.Name).CompareTo(GroupRank(b.Name)));
+        }
+
+        private static void EnsureBucketsForGroup(QuotaGroup group, List<ModelUsage> groupModels)
+        {
+            DateTime now = DateTime.Now;
+
+            // Normalize any existing buckets
+            foreach (var b in group.Buckets)
+            {
+                if (string.IsNullOrEmpty(b.Window))
+                {
+                    if (b.Title.Contains("weekly", StringComparison.OrdinalIgnoreCase))
+                        b.Window = "weekly";
+                    else if (b.Title.Contains("5h", StringComparison.OrdinalIgnoreCase) ||
+                             b.Title.Contains("5 Hour", StringComparison.OrdinalIgnoreCase) ||
+                             b.Title.Contains("5시간", StringComparison.OrdinalIgnoreCase))
+                        b.Window = "5h";
+                    else if (b.ResetTime != DateTime.MinValue && (b.ResetTime - now).TotalHours <= 5)
+                        b.Window = "5h";
+                    else
+                        b.Window = "weekly";
+                }
+            }
+
+            var weeklyBucket = group.Buckets.Find(b => b.Window == "weekly" || b.Title.Contains("Weekly", StringComparison.OrdinalIgnoreCase));
+            var fiveHourBucket = group.Buckets.Find(b => b.Window == "5h" ||
+                                                         b.Title.Contains("5h", StringComparison.OrdinalIgnoreCase) ||
+                                                         b.Title.Contains("Five Hour", StringComparison.OrdinalIgnoreCase));
+
+            // Ensure Weekly Bucket
+            if (weeklyBucket == null)
+            {
+                int minPct = 100;
+                DateTime earliestReset = DateTime.MinValue;
+                var weeklyModels = groupModels.FindAll(m => m.ResetTime == DateTime.MinValue || (m.ResetTime - now).TotalHours > 5);
+                var candidateModels = weeklyModels.Count > 0 ? weeklyModels : groupModels;
+                foreach (var m in candidateModels)
+                {
+                    minPct = Math.Min(minPct, m.RemainingPercent);
+                    if (m.ResetTime != DateTime.MinValue && (earliestReset == DateTime.MinValue || m.ResetTime < earliestReset))
+                    {
+                        earliestReset = m.ResetTime;
+                    }
+                }
+
+                DateTime resetUtc = earliestReset == DateTime.MinValue ? DateTime.MinValue : earliestReset.ToUniversalTime();
+                weeklyBucket = new ModelQuotaItem
+                {
+                    Title = "Weekly Limit Remaining",
+                    Window = "weekly",
+                    RemainingPercent = minPct,
+                    ResetTime = earliestReset,
+                    RefreshTimeText = earliestReset != DateTime.MinValue ? FormatRefreshText("", resetUtc) : "한도 여유",
+                    Description = "You have full weekly quota available."
+                };
+                group.Buckets.Add(weeklyBucket);
+            }
+            else
+            {
+                weeklyBucket.Window = "weekly";
+                if (string.IsNullOrEmpty(weeklyBucket.Title)) weeklyBucket.Title = "Weekly Limit Remaining";
+                if (weeklyBucket.ResetTime == DateTime.MinValue && string.IsNullOrWhiteSpace(weeklyBucket.RefreshTimeText))
+                {
+                    weeklyBucket.RefreshTimeText = weeklyBucket.RemainingPercent >= 100 ? "한도 여유" : "곧 리셋";
+                }
+            }
+
+            // Ensure 5-Hour Bucket
+            if (fiveHourBucket == null)
+            {
+                int minPct = 100;
+                DateTime earliestReset = DateTime.MinValue;
+                var fiveHourModels = groupModels.FindAll(m => m.ResetTime > now && (m.ResetTime - now).TotalHours <= 5);
+                foreach (var m in fiveHourModels)
+                {
+                    minPct = Math.Min(minPct, m.RemainingPercent);
+                    if (m.ResetTime != DateTime.MinValue && (earliestReset == DateTime.MinValue || m.ResetTime < earliestReset))
+                    {
+                        earliestReset = m.ResetTime;
+                    }
+                }
+
+                DateTime resetUtc = earliestReset == DateTime.MinValue ? DateTime.MinValue : earliestReset.ToUniversalTime();
+                fiveHourBucket = new ModelQuotaItem
+                {
+                    Title = "Five Hour Limit Remaining",
+                    Window = "5h",
+                    RemainingPercent = minPct,
+                    ResetTime = earliestReset,
+                    RefreshTimeText = earliestReset != DateTime.MinValue ? FormatRefreshText("", resetUtc) : "한도 여유",
+                    Description = "5시간 한도 여유"
+                };
+                group.Buckets.Add(fiveHourBucket);
+            }
+            else
+            {
+                fiveHourBucket.Window = "5h";
+                if (string.IsNullOrEmpty(fiveHourBucket.Title)) fiveHourBucket.Title = "Five Hour Limit Remaining";
+                if (fiveHourBucket.ResetTime == DateTime.MinValue && string.IsNullOrWhiteSpace(fiveHourBucket.RefreshTimeText))
+                {
+                    fiveHourBucket.RefreshTimeText = fiveHourBucket.RemainingPercent >= 100 ? "한도 여유" : "곧 리셋";
+                }
+            }
+
+            // Keep only the weekly and 5-hour buckets
+            group.Buckets.RemoveAll(b => b != weeklyBucket && b != fiveHourBucket);
+
+            // Weekly first, then 5-hour
+            group.Buckets.Sort((a, b) => (a.Window == "weekly" ? 0 : 1).CompareTo(b.Window == "weekly" ? 0 : 1));
+        }
+
         private static void AddSynthesizedGroups(AgyMetrics metrics, List<ModelUsage> models, bool summaryAvailable)
         {
             if (!summaryAvailable) metrics.Groups = new List<QuotaGroup>();
-
-            bool hasGemini = metrics.Groups.Exists(g => g.Name.Contains("Gemini", StringComparison.OrdinalIgnoreCase));
-            if (!hasGemini)
-            {
-                var gemini = models.FindAll(m => m.Provider == "Google");
-                var group = SynthesizeGroup("Gemini models", gemini);
-                if (group != null) metrics.Groups.Insert(0, group);
-            }
-
-            if (!summaryAvailable)
-            {
-                var others = models.FindAll(m => m.Provider != "Google");
-                var group = SynthesizeGroup("Claude and GPT models", others);
-                if (group != null) metrics.Groups.Add(group);
-            }
-        }
-
-        private static QuotaGroup? SynthesizeGroup(string name, List<ModelUsage> models)
-        {
-            if (models.Count == 0) return null;
-
-            int minPct = 100;
-            DateTime earliestReset = DateTime.MinValue;
-            foreach (var m in models)
-            {
-                minPct = Math.Min(minPct, m.RemainingPercent);
-                if (m.ResetTime != DateTime.MinValue && (earliestReset == DateTime.MinValue || m.ResetTime < earliestReset))
-                {
-                    earliestReset = m.ResetTime;
-                }
-            }
-
-            DateTime resetUtc = earliestReset == DateTime.MinValue ? DateTime.MinValue : earliestReset.ToUniversalTime();
-            return new QuotaGroup
-            {
-                Name = name,
-                IsSynthesized = true,
-                Description = "Models within this group: " + string.Join(", ", models.ConvertAll(m => m.DisplayName)),
-                Buckets =
-                {
-                    new ModelQuotaItem
-                    {
-                        Title = "Quota Remaining",
-                        RemainingPercent = minPct,
-                        ResetTime = earliestReset,
-                        RefreshTimeText = FormatRefreshText("", resetUtc)
-                    }
-                }
-            };
         }
 
         /// <summary>
@@ -589,7 +707,7 @@ namespace AntiGravityMeter
                     if (span.TotalMinutes > 0)
                         return $"it will fully refresh in {span.Minutes} minutes.";
                 }
-                return "it will fully refresh shortly.";
+                return "한도 여유";
             }
 
             int idx = fullDescription.IndexOf("it will fully refresh in", StringComparison.OrdinalIgnoreCase);

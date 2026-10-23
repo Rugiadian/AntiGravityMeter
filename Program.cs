@@ -43,6 +43,16 @@ namespace AntiGravityMeter
                     return;
                 }
 
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += (s, e) =>
+                {
+                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), e.Exception.ToString()); } catch {}
+                };
+                AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+                {
+                    try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "crash.log"), e.ExceptionObject?.ToString() ?? "Unknown error"); } catch {}
+                };
+
                 ApplicationConfiguration.Initialize();
                 Application.Run(new WidgetForm());
             }
