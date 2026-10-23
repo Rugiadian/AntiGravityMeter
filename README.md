@@ -14,12 +14,16 @@ Google Antigravity의 실제 모델 사용량(Weekly & 5-Hour Limit Quota)을 �
 - **동그라미 도넛 게이지 인포그래픽 (`CircularQuotaCard`)**:
   - 원형 링 게이지 & 큼직한 퍼센트(%) 표시
   - 잔여량에 따른 직관적 컬러 변화 (초록 70%+ / 주황 30%+ / 빨강 30% 미만)
-- **Gemini Models 전용 포커스**: 사용자가 사용하는 Gemini 계열 주력 모델 쿼터만 깔끔하게 노출
+- **모든 쿼터 그룹 표시**: `retrieveUserQuotaSummary`가 반환하는 모든 그룹(예: *Claude and GPT models*)의 Weekly / 5-Hour 한도를 그룹별 섹션으로 표시
+  - 요약 API에 없는 그룹(예: *Gemini models*)은 `fetchAvailableModels`의 모델별 `quotaInfo`로 계산하여 표시 (그룹 이름에 마우스를 올리면 포함 모델 목록 툴팁)
+- **모델별 사용량 (Per-Model Usage)**: `fetchAvailableModels` 기반으로 사용 가능한 모든 모델(Gemini, Claude, GPT-OSS 등)의 잔여량 바 / % / 리셋까지 남은 시간 표시
+  - Low / Medium / High 등 effort 변형은 하나의 모델로 병합
+  - 헤더의 **☰ 버튼**으로 목록 펼치기/접기 (위젯 높이 자동 조정, 하단 위치 고정)
 
 ### 2. 초소형 콤팩트 플로팅 위젯 디자인
 - **군더더기 없는 극단적 심플함**:
-  - 불필요한 고급 통계, DB/로그 스캔을 모두 제거하여 오직 주간 & 5시간 쿼터 원형 게이지만 표시
-  - 너비 360px, 높이 186px의 미니멀 사이즈로 작업 영역을 방해하지 않음
+  - 불필요한 고급 통계, DB/로그 스캔을 모두 제거하여 쿼터 게이지와 모델별 잔여량만 표시
+  - 너비 360px 고정, 높이는 표시할 그룹/모델 수에 맞춰 자동 조정되어 작업 영역을 방해하지 않음
   - CPU/RAM 점유율 최소화 (단 520KB 단일 실행 파일)
 - **편리한 조작**:
   - 위젯 본체 어디든 마우스 드래그로 자유롭게 이동
@@ -60,8 +64,9 @@ G:\Git\AntiGravityMeter\
 ├── Program.cs                # 메인 엔트리포인트 및 콘솔 테스트 모드
 ├── Models.cs                 # 쿼터 메트릭 데이터 구조체 정의
 ├── CircularQuotaCard.cs      # 원형 도넛 링 게이지 인포그래픽 커스텀 컨트롤
+├── ModelUsageRow.cs          # 모델별 사용량 한 줄 바(bar) 커스텀 컨트롤
 ├── AgyCollector.cs           # 공식 retrieveUserQuotaSummary 실시간 수집 엔진
-├── WidgetForm.cs             # 미려한 다크 테마 커스텀 플로팅 위젯 UI (186px 컴팩트)
+├── WidgetForm.cs             # 미려한 다크 테마 커스텀 플로팅 위젯 UI (높이 자동 조정)
 ├── build.bat                 # 릴리즈 빌드 배치 스크립트
 ├── Run_Widget.bat            # 위젯 즉시 실행 배치 파일
 ├── README.md                 # 본 설명 문서

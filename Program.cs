@@ -19,11 +19,25 @@ namespace AntiGravityMeter
                     AttachConsole(-1);
                     var collector = new AgyCollector();
                     var m = await collector.CollectMetricsAsync(true);
-                    string testOutput = $"=== AntiGravity Quota Results ===\n" +
-                        $"Plan: {m.UserPlan}\n" +
-                        $"Status: {m.Status}\n" +
-                        $"Weekly Limit Remaining: {m.WeeklyLimit.RemainingPercent}% ({m.WeeklyLimit.RefreshTimeText})\n" +
-                        $"Five Hour Limit Remaining: {m.FiveHourLimit.RemainingPercent}% ({m.FiveHourLimit.RefreshTimeText})\n";
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("=== AntiGravity Quota Results ===");
+                    sb.AppendLine($"Plan: {m.UserPlan}");
+                    sb.AppendLine($"Status: {m.Status}");
+                    foreach (var g in m.Groups)
+                    {
+                        sb.AppendLine();
+                        sb.AppendLine($"[{g.Name}]{(g.IsSynthesized ? " (from per-model quotaInfo)" : "")}");
+                        foreach (var b in g.Buckets)
+                            sb.AppendLine($"  {b.Title}: {b.RemainingPercent}% ({b.RefreshTimeText})");
+                    }
+                    sb.AppendLine();
+                    sb.AppendLine("[Per-Model Usage]");
+                    foreach (var mu in m.Models)
+                    {
+                        string reset = mu.ResetTime == DateTime.MinValue ? "-" : mu.ResetTime.ToString("yyyy-MM-dd HH:mm");
+                        sb.AppendLine($"  {mu.DisplayName,-28} {mu.Provider,-10} {mu.RemainingPercent,3}%  reset {reset}");
+                    }
+                    string testOutput = sb.ToString();
                     File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "test_results.txt"), testOutput);
                     Console.WriteLine(testOutput);
                     return;

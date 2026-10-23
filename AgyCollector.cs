@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Management;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -50,21 +52,19 @@ namespace AntiGravityMeter
             uint reserved = 0);
 
         private const int AF_INET = 2;
-        private const int TCP_TABLE_OWNER_PID_LISTENER = 2;
+        private const int TCP_TABLE_OWNER_PID_ALL = 5;
+        private const uint MIB_TCP_STATE_LISTEN = 2;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct MIB_TCPROW_OWNER_PID
         {
             public uint state;
             public uint localAddr;
-            public byte localPort1;
-            public byte localPort2;
-            public byte localPort3;
-            public byte localPort4;
+            public uint localPort;
             public uint remoteAddr;
             public uint remotePort;
             public int owningPid;
-            public ushort LocalPort => (ushort)((localPort1 << 8) | localPort2);
+            public ushort LocalPort => (ushort)(((localPort & 0xFF) << 8) | ((localPort >> 8) & 0xFF));
         }
 
         private readonly HttpClient _cloudHttpClient;
@@ -133,37 +133,69 @@ namespace AntiGravityMeter
             // 2. Exact Quota Collection
             // Method 1: Google CloudCode retrieveUserQuotaSummary endpoint (Works for CLI & IDE directly)
             // Method 2: Local Antigravity Language Server RPC
-            // Method 3: Fallback to fetchAvailableModels
+            // Plus: fetchAvailableModels for per-model usage (and groups missing from the summary, e.g. Gemini)
             bool needFetch = forceRefreshQuota ||
                              (DateTime.UtcNow - _lastQuotaFetchTime).TotalSeconds > 4 ||
-                             _cachedMetrics.WeeklyLimit.RemainingPercent == 100 && _cachedMetrics.WeeklyLimit.RefreshTimeText == "";
+                             _cachedMetrics.Groups.Count == 0;
 
             if (needFetch)
             {
-                bool success = await FetchCloudQuotaSummaryAsync(metrics);
+                // 1순위: 로컬 Language Server (Gemini 주간/5h, Claude 주간/5h, Argon 등 모든 그룹 완벽 제공)
+                // 2순위: Google CloudCode 직접 호출 (IDE 미실행 시 fallback)
+                var modelsTask = FetchCloudAvailableModelsAsync();
+                bool success = await FetchLanguageServerQuotaAsync(metrics);
                 if (!success)
                 {
-                    success = await FetchLanguageServerQuotaAsync(metrics);
+                    success = await FetchCloudQuotaSummaryAsync(metrics);
                 }
-                if (!success)
+                await modelsTask;
+
+                // Fall back to last known model list if this round's request failed
+                var models = modelsTask.Result ?? _cachedMetrics.Models;
+                metrics.Models = models;
+
+                if (success || models.Count > 0)
                 {
-                    await FetchCloudAvailableModelsFallbackAsync(metrics);
+                    AddSynthesizedGroups(metrics, models, summaryAvailable: success);
                 }
+                else
+                {
+                    // Keep the last known values if every source failed this round
+                    metrics.Groups = _cachedMetrics.Groups;
+                }
+
+                SyncLegacyGeminiLimits(metrics);
 
                 _lastQuotaFetchTime = DateTime.UtcNow;
                 _cachedMetrics.WeeklyLimit = metrics.WeeklyLimit;
                 _cachedMetrics.FiveHourLimit = metrics.FiveHourLimit;
                 _cachedMetrics.UserPlan = metrics.UserPlan;
+                _cachedMetrics.Groups = metrics.Groups;
+                _cachedMetrics.Models = metrics.Models;
             }
             else
             {
                 metrics.WeeklyLimit = _cachedMetrics.WeeklyLimit;
                 metrics.FiveHourLimit = _cachedMetrics.FiveHourLimit;
                 metrics.UserPlan = _cachedMetrics.UserPlan;
+                metrics.Groups = _cachedMetrics.Groups;
+                metrics.Models = _cachedMetrics.Models;
             }
 
             return metrics;
         }
+
+        private static readonly string[] QuotaSummaryEndpoints = new[]
+        {
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+        };
+
+        private static readonly string[] AvailableModelsEndpoints = new[]
+        {
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+        };
 
         /// <summary>
         /// Calls the official CloudCode retrieveUserQuotaSummary endpoint using the user's stored OAuth token.
@@ -174,29 +206,34 @@ namespace AntiGravityMeter
             string? token = GetKeyringToken();
             if (string.IsNullOrEmpty(token)) return false;
 
-            try
+            foreach (var url in QuotaSummaryEndpoints)
             {
-                using var req = new HttpRequestMessage(HttpMethod.Post, "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary");
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                req.Headers.Add("User-Agent", "antigravity-cli");
-                req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+                try
+                {
+                    using var req = new HttpRequestMessage(HttpMethod.Post, url);
+                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    req.Headers.Add("User-Agent", "antigravity-cli");
+                    req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
 
-                using var resp = await _cloudHttpClient.SendAsync(req);
-                if (!resp.IsSuccessStatusCode) return false;
+                    using var resp = await _cloudHttpClient.SendAsync(req);
+                    if (!resp.IsSuccessStatusCode) continue;
 
-                string json = await resp.Content.ReadAsStringAsync();
-                using var doc = JsonDocument.Parse(json);
-                return ParseQuotaSummaryJson(doc.RootElement, metrics);
+                    string json = await resp.Content.ReadAsStringAsync();
+                    using var doc = JsonDocument.Parse(json);
+                    if (ParseQuotaSummaryJson(doc.RootElement, metrics))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                }
             }
-            catch
-            {
-                return false;
-            }
+
+            return false;
         }
 
         /// <summary>
-        /// Secondary method: queries local language_server if Antigravity Desktop App is active.
-        /// </summary>
         private async Task<bool> FetchLanguageServerQuotaAsync(AgyMetrics metrics)
         {
             try
@@ -243,61 +280,225 @@ namespace AntiGravityMeter
         }
 
         /// <summary>
-        /// Fallback method using fetchAvailableModels if retrieveUserQuotaSummary is unreachable.
+        /// Fetches every available model with its quotaInfo via fetchAvailableModels.
+        /// Effort variants ("(Low)", "(Medium)", "(High)") are merged into one entry.
+        /// Returns null if the request failed.
         /// </summary>
-        private async Task FetchCloudAvailableModelsFallbackAsync(AgyMetrics metrics)
+        private async Task<List<ModelUsage>?> FetchCloudAvailableModelsAsync()
         {
             string? token = GetKeyringToken();
-            if (string.IsNullOrEmpty(token)) return;
+            if (string.IsNullOrEmpty(token)) return null;
 
-            try
+            foreach (var url in AvailableModelsEndpoints)
             {
-                using var req = new HttpRequestMessage(HttpMethod.Post, "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels");
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                req.Headers.Add("User-Agent", "antigravity-cli");
-                req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
-
-                using var resp = await _cloudHttpClient.SendAsync(req);
-                if (resp.IsSuccessStatusCode)
+                try
                 {
+                    using var req = new HttpRequestMessage(HttpMethod.Post, url);
+                    req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+                    req.Headers.Add("User-Agent", "antigravity-cli");
+                    req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+
+                    using var resp = await _cloudHttpClient.SendAsync(req);
+                    if (!resp.IsSuccessStatusCode) continue;
+
                     string json = await resp.Content.ReadAsStringAsync();
                     using var doc = JsonDocument.Parse(json);
+                    return ParseAvailableModelsJson(doc.RootElement);
+                }
+                catch
+                {
+                }
+            }
 
-                    if (doc.RootElement.TryGetProperty("models", out var modelsProp))
+            return null;
+        }
+
+        private static readonly Regex EffortSuffixRegex = new(
+            @"\s*\((Extra Low|Low|Medium|High|Minimal|Thinking)\)\s*$",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        private static List<ModelUsage> ParseAvailableModelsJson(JsonElement root)
+        {
+            var result = new Dictionary<string, ModelUsage>(StringComparer.OrdinalIgnoreCase);
+            if (!root.TryGetProperty("models", out var modelsProp) || modelsProp.ValueKind != JsonValueKind.Object)
+            {
+                return new List<ModelUsage>();
+            }
+
+            // Order used by Antigravity's own model picker
+            var sortIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            if (root.TryGetProperty("agentModelSorts", out var sortsProp) && sortsProp.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var sort in sortsProp.EnumerateArray())
+                {
+                    if (!sort.TryGetProperty("groups", out var sg) || sg.ValueKind != JsonValueKind.Array) continue;
+                    foreach (var g in sg.EnumerateArray())
                     {
-                        foreach (var prop in modelsProp.EnumerateObject())
+                        if (!g.TryGetProperty("modelIds", out var ids) || ids.ValueKind != JsonValueKind.Array) continue;
+                        foreach (var id in ids.EnumerateArray())
                         {
-                            string modelName = prop.Name;
-                            if (modelName.StartsWith("gemini-") && prop.Value.TryGetProperty("quotaInfo", out var qInfo))
-                            {
-                                double remaining = 1.0;
-                                if (qInfo.TryGetProperty("remainingFraction", out var remProp))
-                                {
-                                    remaining = remProp.GetDouble();
-                                }
-
-                                DateTime resetTimeUtc = DateTime.MinValue;
-                                if (qInfo.TryGetProperty("resetTime", out var resetProp))
-                                {
-                                    if (DateTime.TryParse(resetProp.GetString(), out var dt))
-                                    {
-                                        resetTimeUtc = dt.ToUniversalTime();
-                                    }
-                                }
-
-                                int percent = Math.Clamp((int)Math.Round(remaining * 100.0), 0, 100);
-
-                                metrics.FiveHourLimit.RemainingPercent = percent;
-                                metrics.FiveHourLimit.ResetTime = resetTimeUtc.ToLocalTime();
-                                metrics.FiveHourLimit.RefreshTimeText = FormatRefreshText("", resetTimeUtc);
-                                break;
-                            }
+                            string? s = id.GetString();
+                            if (!string.IsNullOrEmpty(s) && !sortIndex.ContainsKey(s)) sortIndex[s] = sortIndex.Count;
                         }
                     }
                 }
             }
-            catch
+
+            foreach (var prop in modelsProp.EnumerateObject())
             {
+                var m = prop.Value;
+                string displayName = m.TryGetProperty("displayName", out var dn) ? dn.GetString() ?? "" : "";
+                string apiProvider = m.TryGetProperty("apiProvider", out var ap) ? ap.GetString() ?? "" : "";
+                if (string.IsNullOrWhiteSpace(displayName)) continue;            // internal / tab-completion models
+                if (apiProvider.Contains("INTERNAL", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!m.TryGetProperty("quotaInfo", out var qInfo)) continue;
+
+                double remaining = qInfo.TryGetProperty("remainingFraction", out var remProp) &&
+                                   remProp.ValueKind == JsonValueKind.Number ? remProp.GetDouble() : 1.0;
+                DateTime resetLocal = qInfo.TryGetProperty("resetTime", out var rtProp)
+                    ? ParseUtc(rtProp.GetString()) is DateTime u && u != DateTime.MinValue ? u.ToLocalTime() : DateTime.MinValue
+                    : DateTime.MinValue;
+
+                string provider = m.TryGetProperty("modelProvider", out var mp) ? FormatProvider(mp.GetString()) : "";
+                string baseName = EffortSuffixRegex.Replace(displayName, "").Trim();
+                int pct = Math.Clamp((int)Math.Round(remaining * 100.0), 0, 100);
+                int order = sortIndex.TryGetValue(prop.Name, out int idx) ? idx : int.MaxValue;
+
+                if (!result.TryGetValue(baseName, out var usage))
+                {
+                    usage = new ModelUsage
+                    {
+                        DisplayName = baseName,
+                        Provider = provider,
+                        RemainingPercent = pct,
+                        ResetTime = resetLocal,
+                        SortOrder = order
+                    };
+                    result[baseName] = usage;
+                }
+                else
+                {
+                    // Variants normally share a pool; be conservative and keep the lowest value
+                    usage.RemainingPercent = Math.Min(usage.RemainingPercent, pct);
+                    if (resetLocal != DateTime.MinValue &&
+                        (usage.ResetTime == DateTime.MinValue || resetLocal < usage.ResetTime))
+                    {
+                        usage.ResetTime = resetLocal;
+                    }
+                    usage.SortOrder = Math.Min(usage.SortOrder, order);
+                }
+                usage.ModelIds.Add(prop.Name);
+            }
+
+            return result.Values
+                .OrderBy(u => ProviderRank(u.Provider))
+                .ThenBy(u => u.SortOrder)
+                .ThenBy(u => u.DisplayName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static int ProviderRank(string provider) => provider switch
+        {
+            "Google" => 0,
+            "Anthropic" => 1,
+            "OpenAI" => 2,
+            _ => 3
+        };
+
+        private static string FormatProvider(string? raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            string s = raw.Replace("MODEL_PROVIDER_", "", StringComparison.OrdinalIgnoreCase);
+            return s.ToUpperInvariant() switch
+            {
+                "GOOGLE" => "Google",
+                "ANTHROPIC" => "Anthropic",
+                "OPENAI" => "OpenAI",
+                _ => s.Length > 1 ? char.ToUpperInvariant(s[0]) + s.Substring(1).ToLowerInvariant() : s
+            };
+        }
+
+        private static DateTime ParseUtc(string? s)
+        {
+            if (!string.IsNullOrEmpty(s) &&
+                DateTime.TryParse(s, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var dt))
+            {
+                return dt;
+            }
+            return DateTime.MinValue;
+        }
+
+        /// <summary>
+        /// The quota summary currently only reports some pools (e.g. "Claude and GPT models").
+        /// Pools that are missing are synthesized from per-model quotaInfo.
+        /// </summary>
+        private static void AddSynthesizedGroups(AgyMetrics metrics, List<ModelUsage> models, bool summaryAvailable)
+        {
+            if (!summaryAvailable) metrics.Groups = new List<QuotaGroup>();
+
+            bool hasGemini = metrics.Groups.Exists(g => g.Name.Contains("Gemini", StringComparison.OrdinalIgnoreCase));
+            if (!hasGemini)
+            {
+                var gemini = models.FindAll(m => m.Provider == "Google");
+                var group = SynthesizeGroup("Gemini models", gemini);
+                if (group != null) metrics.Groups.Insert(0, group);
+            }
+
+            if (!summaryAvailable)
+            {
+                var others = models.FindAll(m => m.Provider != "Google");
+                var group = SynthesizeGroup("Claude and GPT models", others);
+                if (group != null) metrics.Groups.Add(group);
+            }
+        }
+
+        private static QuotaGroup? SynthesizeGroup(string name, List<ModelUsage> models)
+        {
+            if (models.Count == 0) return null;
+
+            int minPct = 100;
+            DateTime earliestReset = DateTime.MinValue;
+            foreach (var m in models)
+            {
+                minPct = Math.Min(minPct, m.RemainingPercent);
+                if (m.ResetTime != DateTime.MinValue && (earliestReset == DateTime.MinValue || m.ResetTime < earliestReset))
+                {
+                    earliestReset = m.ResetTime;
+                }
+            }
+
+            DateTime resetUtc = earliestReset == DateTime.MinValue ? DateTime.MinValue : earliestReset.ToUniversalTime();
+            return new QuotaGroup
+            {
+                Name = name,
+                IsSynthesized = true,
+                Description = "Models within this group: " + string.Join(", ", models.ConvertAll(m => m.DisplayName)),
+                Buckets =
+                {
+                    new ModelQuotaItem
+                    {
+                        Title = "Quota Remaining",
+                        RemainingPercent = minPct,
+                        ResetTime = earliestReset,
+                        RefreshTimeText = FormatRefreshText("", resetUtc)
+                    }
+                }
+            };
+        }
+
+        /// <summary>
+        /// Keeps the legacy WeeklyLimit / FiveHourLimit properties pointing at the Gemini pool.
+        /// </summary>
+        private static void SyncLegacyGeminiLimits(AgyMetrics metrics)
+        {
+            var gemini = metrics.Groups.Find(g => g.Name.Contains("Gemini", StringComparison.OrdinalIgnoreCase));
+            if (gemini == null) return;
+
+            foreach (var b in gemini.Buckets)
+            {
+                if (b.Window == "weekly") metrics.WeeklyLimit = b;
+                else metrics.FiveHourLimit = b;
             }
         }
 
@@ -309,56 +510,69 @@ namespace AntiGravityMeter
                 target = respEl;
             }
 
-            if (!target.TryGetProperty("groups", out var groupsProp))
+            if (!target.TryGetProperty("groups", out var groupsProp) || groupsProp.ValueKind != JsonValueKind.Array)
             {
                 return false;
             }
 
+            var groups = new List<QuotaGroup>();
             foreach (var group in groupsProp.EnumerateArray())
             {
-                string dispName = group.TryGetProperty("displayName", out var dp) ? dp.GetString() ?? "" : "";
-                if (!dispName.Contains("Gemini", StringComparison.OrdinalIgnoreCase)) continue;
+                var qg = new QuotaGroup
+                {
+                    Name = group.TryGetProperty("displayName", out var dp) ? dp.GetString() ?? "" : "",
+                    Description = group.TryGetProperty("description", out var gd) ? gd.GetString() ?? "" : ""
+                };
 
-                if (group.TryGetProperty("buckets", out var bucketsProp))
+                if (group.TryGetProperty("buckets", out var bucketsProp) && bucketsProp.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var bucket in bucketsProp.EnumerateArray())
                     {
                         string window = bucket.TryGetProperty("window", out var winProp) ? winProp.GetString() ?? "" : "";
                         string bucketId = bucket.TryGetProperty("bucketId", out var bIdProp) ? bIdProp.GetString() ?? "" : "";
-                        double remFraction = bucket.TryGetProperty("remainingFraction", out var rfProp) ? rfProp.GetDouble() : 1.0;
+                        string title = bucket.TryGetProperty("displayName", out var bdn) ? bdn.GetString() ?? "" : "";
+                        double remFraction = bucket.TryGetProperty("remainingFraction", out var rfProp) &&
+                                             rfProp.ValueKind == JsonValueKind.Number ? rfProp.GetDouble() : 1.0;
                         string desc = bucket.TryGetProperty("description", out var descProp) ? descProp.GetString() ?? "" : "";
-                        string resetTimeStr = bucket.TryGetProperty("resetTime", out var rtProp) ? rtProp.GetString() ?? "" : "";
+                        DateTime resetTimeUtc = ParseUtc(bucket.TryGetProperty("resetTime", out var rtProp) ? rtProp.GetString() : null);
 
-                        DateTime resetTimeUtc = DateTime.MinValue;
-                        if (DateTime.TryParse(resetTimeStr, out var parsedDt))
+                        if (window == "" && bucketId.Contains("weekly", StringComparison.OrdinalIgnoreCase)) window = "weekly";
+                        if (window == "" && bucketId.Contains("5h", StringComparison.OrdinalIgnoreCase)) window = "5h";
+                        if (string.IsNullOrEmpty(title))
                         {
-                            resetTimeUtc = parsedDt.ToUniversalTime();
+                            title = window == "weekly" ? "Weekly Limit Remaining"
+                                  : window == "5h" ? "Five Hour Limit Remaining"
+                                  : "Limit Remaining";
                         }
 
-                        int pct = Math.Clamp((int)Math.Round(remFraction * 100.0), 0, 100);
-                        string refreshText = FormatRefreshText(desc, resetTimeUtc);
-
-                        if (window == "weekly" || bucketId.Contains("weekly", StringComparison.OrdinalIgnoreCase))
+                        qg.Buckets.Add(new ModelQuotaItem
                         {
-                            metrics.WeeklyLimit.RemainingPercent = pct;
-                            metrics.WeeklyLimit.ResetTime = resetTimeUtc.ToLocalTime();
-                            metrics.WeeklyLimit.RefreshTimeText = refreshText;
-                            metrics.WeeklyLimit.Description = desc;
-                        }
-                        else if (window == "5h" || bucketId.Contains("5h", StringComparison.OrdinalIgnoreCase))
-                        {
-                            metrics.FiveHourLimit.RemainingPercent = pct;
-                            metrics.FiveHourLimit.ResetTime = resetTimeUtc.ToLocalTime();
-                            metrics.FiveHourLimit.RefreshTimeText = refreshText;
-                            metrics.FiveHourLimit.Description = desc;
-                        }
+                            Title = title,
+                            Window = window,
+                            Description = desc,
+                            RemainingPercent = Math.Clamp((int)Math.Round(remFraction * 100.0), 0, 100),
+                            ResetTime = resetTimeUtc == DateTime.MinValue ? DateTime.MinValue : resetTimeUtc.ToLocalTime(),
+                            RefreshTimeText = FormatRefreshText(desc, resetTimeUtc)
+                        });
                     }
                 }
 
-                return true;
+                // Weekly first, then 5-hour
+                qg.Buckets.Sort((a, b) => (a.Window == "weekly" ? 0 : 1).CompareTo(b.Window == "weekly" ? 0 : 1));
+                if (qg.Buckets.Count > 0) groups.Add(qg);
             }
 
-            return false;
+            if (groups.Count == 0) return false;
+            groups.Sort((a, b) => GroupRank(a.Name).CompareTo(GroupRank(b.Name)));
+            metrics.Groups = groups;
+            return true;
+        }
+
+        private static int GroupRank(string name)
+        {
+            if (name.Contains("Gemini", StringComparison.OrdinalIgnoreCase)) return 0;
+            if (name.Contains("Claude", StringComparison.OrdinalIgnoreCase)) return 1;
+            return 2;
         }
 
         private static string FormatRefreshText(string fullDescription, DateTime resetTimeUtc)
@@ -446,23 +660,24 @@ namespace AntiGravityMeter
             if (pid <= 0) return ports;
 
             int size = 0;
-            GetExtendedTcpTable(IntPtr.Zero, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER);
+            GetExtendedTcpTable(IntPtr.Zero, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
 
             IntPtr pTcpTable = Marshal.AllocHGlobal(size);
             try
             {
-                if (GetExtendedTcpTable(pTcpTable, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_LISTENER) == 0)
+                if (GetExtendedTcpTable(pTcpTable, ref size, true, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == 0)
                 {
                     int rowCount = Marshal.ReadInt32(pTcpTable);
-                    IntPtr rowPtr = IntPtr.Add(pTcpTable, sizeof(int));
+                    IntPtr rowPtr = IntPtr.Add(pTcpTable, 4);
                     int rowSize = Marshal.SizeOf<MIB_TCPROW_OWNER_PID>();
 
                     for (int i = 0; i < rowCount; i++)
                     {
                         var row = Marshal.PtrToStructure<MIB_TCPROW_OWNER_PID>(rowPtr);
-                        if (row.owningPid == pid)
+                        if (row.owningPid == pid && (row.state == MIB_TCP_STATE_LISTEN || row.state == 5))
                         {
-                            ports.Add(row.LocalPort);
+                            if (!ports.Contains(row.LocalPort))
+                                ports.Add(row.LocalPort);
                         }
                         rowPtr = IntPtr.Add(rowPtr, rowSize);
                     }

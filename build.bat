@@ -6,6 +6,7 @@ echo ========================================================
 echo.
 
 set ROOT_DIR=%~dp0
+taskkill /f /im AntiGravityMeter.exe > nul 2>&1
 echo [1/2] 릴리즈 빌드 중...
 dotnet publish "%ROOT_DIR%AntiGravityMeter.csproj" -c Release -r win-x64 --self-contained false -o "%ROOT_DIR%Publish"
 if errorlevel 1 (
